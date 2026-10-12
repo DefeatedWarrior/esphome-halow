@@ -1,8 +1,8 @@
 # esphome-halow
 
-> **Fork note:** this fork of [sweitzja/esphome-halow](https://github.com/sweitzja/esphome-halow) adds four fixes so the component builds and runs on **ESPHome 2026.x** (native ESP-IDF toolchain, as used by the Home Assistant ESPHome Builder). See [PATCHES.md](PATCHES.md) for details.
+> **Fork note:** this fork of [sweitzja/esphome-halow](https://github.com/sweitzja/esphome-halow) makes the component build and run on **ESPHome 2026.x** (native ESP-IDF toolchain, as used by the Home Assistant ESPHome Builder) and fixes several bugs found in review — including Home Assistant API connections being dropped on 2026.x, reconnect races, and an unpinned SDK download. See [PATCHES.md](PATCHES.md) for every change and why.
 
-ESPHome external component for **Wi-Fi HaLow** (IEEE 802.11ah) using the [Morse Micro MM6108](https://www.morsemicro.com/chips/) SoC. Wi-Fi HaLow operates in sub-1 GHz spectrum (902-928 MHz in North America), offering up to 1 km range with low power consumption -- ideal for IoT devices that need to reach beyond standard Wi-Fi range.
+ESPHome external component for **Wi-Fi HaLow** (IEEE 802.11ah) using the [Morse Micro MM6108](https://www.morsemicro.com/chips/) SoC. Wi-Fi HaLow operates in sub-1 GHz spectrum (902-928 MHz in North America, 915-928 MHz in Australia), offering up to 1 km range with low power consumption -- ideal for IoT devices that need to reach beyond standard Wi-Fi range.
 
 This component provides a drop-in network interface for ESPHome, replacing `wifi:` with `halow:`. It works like the built-in W5500/Ethernet SPI support: configure your pins, SSID, and password in YAML, and get full Home Assistant connectivity over HaLow.
 
@@ -25,7 +25,7 @@ LoRa still wins on raw range (10-15km vs ~1km) and power efficiency for simple o
 |-------|--------|-------|
 | Seeed XIAO ESP32-S3 | Tested | Default pin mapping matches HaLow Hat |
 | Other ESP32-S3 boards | Should work | Configure SPI pins in YAML |
-| ESP32-C6 | Untested | Supported by MM-IoT-SDK |
+| ESP32-C6 | Not supported | The component sets ESP32-S3-specific options |
 
 ### Access Points
 | AP | Status | Notes |
@@ -36,10 +36,12 @@ LoRa still wins on raw range (10-15km vs ~1km) and power efficiency for simple o
 ## Quick Start
 
 ### Prerequisites
-- ESPHome 2024.2+ with ESP-IDF framework support
+- ESPHome with the ESP-IDF framework. This fork is tested with **ESPHome 2026.9.1** (ESP-IDF 5.5.5), including the Home Assistant ESPHome Builder add-on.
 - Git (for automatic SDK download on first compile)
+- A HaLow AP bridged to your LAN (see [Access Point Setup](#access-point-setup-required))
+- A solid 5 V supply: the radio draws a current spike when it powers up its RF section (see [Troubleshooting](#troubleshooting))
 
-The [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) is downloaded automatically on first compile. No manual setup needed. No patches required.
+The [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) is downloaded automatically on first compile, pinned to the commit this component is tested against (`96d9bf4`). No manual setup needed. No patches required.
 
 ### Example YAML
 
@@ -57,15 +59,15 @@ esp32:
 external_components:
   - source: github://DefeatedWarrior/esphome-halow
     components: [halow]
+    # refresh: 1min                    # pick up new commits without waiting a day
 
 halow:
-  type: MM6108                         # MM6108 (station) or MM8108 (station/AP)
-  mode: STATION                        # STATION or AP (AP requires MM8108)
-  ssid: "my-halow-ap"
-  password: "my-password"
-  country_code: "US"
+  ssid: !secret halow_ssid
+  password: !secret halow_password
+  country_code: "US"                   # required: must match your region and AP (AU, CA, EU, GB, IN, JP, KR, NZ, US)
   security: SAE                        # SAE (WPA3), OWE, or OPEN
   # sub_bands: false                   # false=max throughput (8MHz), true=max range (1-2MHz)
+  # max_tx_power: 20                   # optional cap in dBm (default: regulatory maximum)
   # manual_ip:                         # Optional static IP
   #   static_ip: 192.168.12.100
   #   gateway: 192.168.12.1
@@ -178,11 +180,11 @@ Default pin mapping for the Seeed XIAO HaLow Hat:
 | SPI SCK | 7 | D8 | Output |
 | SPI MISO | 8 | D9 | Input |
 | SPI MOSI | 9 | D10 | Output |
-| SPI CS | 4 | D4 | Output |
-| SPI IRQ | 3 | D3 | Input (data-ready interrupt) |
-| RESET_N | 1 | D1 | Output (active low) |
-| WAKE | 2 | D2 | Output |
-| BUSY | 5 | D5 | Input (rising edge) |
+| SPI CS | 4 | D3 | Output |
+| SPI IRQ | 3 | D2 | Input (data-ready interrupt) |
+| RESET_N | 1 | D0 | Output (active low) |
+| WAKE | 2 | D1 | Output |
+| BUSY | 5 | D4 | Input (rising edge) |
 
 Source: [Seeed mm-iot-esp32 Kconfig](https://github.com/Seeed-Studio/mm-iot-esp32/blob/main/framework/mm_shims/Kconfig)
 
@@ -193,13 +195,13 @@ The MM6108 has no persistent firmware. Two binary files are embedded in the ESP3
 | File | Purpose | Size | Source |
 |------|---------|------|--------|
 | `mm6108.mbin` | MM6108 SoC firmware (v1.17.6) | ~400 KB | MM-IoT-SDK `framework/morsefirmware/` |
-| `bcf_mf16858.mbin` | Board config for FGH100M-H | ~2 KB | MM-IoT-SDK `framework/morsefirmware/mm6108/bcfs/` |
+| `bcf_mf16858.mbin` | Board config for the MF16858 module (XIAO HaLow Hat / FGH100M-H); regulatory certified for US and CA, compliant for AU | ~2 KB | MM-IoT-SDK `framework/morsefirmware/mm6108/bcfs/` |
 
 **Important**: Firmware and BCF must be from the same SDK version.
 
 ## Verified Test Results
 
-All testing performed with XIAO ESP32-S3 + XIAO HaLow Hat + GL-iNet HaLowLink 2:
+All testing performed with XIAO ESP32-S3 + XIAO HaLow Hat + GL-iNet HaLowLink 2 by the original author, on ESPHome before 2026.x (PlatformIO toolchain, IDF 5.5.2). On ESPHome 2026.9.1 this fork has been verified to compile, boot the MM6108, associate with WPA3-SAE, get a DHCP lease and register mDNS (AU region); see [PATCHES.md](PATCHES.md) for what has and hasn't been re-tested.
 
 | Test | Result |
 |------|--------|
@@ -242,24 +244,40 @@ or communicate with the device.
 on the HaLow interface by default. Without disabling it, HaLow devices can reach the internet
 but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discovery.
 
+## Troubleshooting
+
+**The board resets at "Connecting to '...'"** — the log stops right after `Connecting to '<ssid>' (SAE)...`, the USB serial port drops, and the next boot reports a power-on reset (`debug:` component: *Reset Reason: Power On*). `mmwlan_sta_enable()` powers up the MM6108's RF section at that moment; if the 3.3 V rail collapses the ESP32 cold-boots. This is a power or hardware problem, not firmware: lowering `max_tx_power` doesn't help because it happens before any transmission. Check the hat is fully seated with no bent pins, the antenna is firmly attached, and try a different USB cable, port or a powered hub.
+
+**It connects but Home Assistant can't reach it** — the AP is probably routing/NATing the HaLow network instead of bridging it. Follow [Access Point Setup](#access-point-setup-required), including disabling masquerade. You can check from another machine on your LAN with `ping <device-ip>`.
+
+**"Connect timeout" with no `STA state: CONNECTING`** — the device never found the AP. Check `country_code` matches the AP's region: the channel plans don't overlap in the way you might expect (for example, a `US` device won't find an `AU` AP).
+
+**Changes to this repo don't show up in the Home Assistant ESPHome Builder** — external components are cached for a day. Add `refresh: 1min` (or `always`) under the `external_components` source.
+
+**"halow: could not find is_connected() in ESPHome's network component"** — your ESPHome version restructured the network component and this component needs updating; it refuses to build rather than produce firmware that silently drops API connections.
+
 ## Known Limitations
 
-- **Power save disabled** — The MM6108 BUSY pin has a firmware bug (confirmed by Morse Micro). Power save is disabled to ensure reliable bidirectional communication. Monitor [firmware releases](https://github.com/MorseMicro/firmware_binaries/releases/) for a fix.
+- **Power save disabled** — The MM6108 BUSY pin has a firmware bug (confirmed by Morse Micro). Power save is disabled to ensure reliable bidirectional communication. The radio therefore draws full receive current all the time. Monitor [firmware releases](https://github.com/MorseMicro/firmware_binaries/releases/) for a fix.
 - **TWT not yet implemented** — Requires working BUSY pin for battery operation. A GPIO-based workaround exists but is not integrated.
+- **Station mode, MM6108 only** — AP mode and the MM8108 are not implemented; the config rejects them.
+- **ESP32-S3 only** — other ESP32 variants are not supported.
 
 ## Component Configuration
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `type` | enum | `MM6108` | Chip type: `MM6108` or `MM8108` |
-| `mode` | enum | `STATION` | Operating mode: `STATION` or `AP` (AP requires MM8108) |
-| `ssid` | string | **required** | HaLow AP SSID (station mode) |
-| `password` | string | **required** | WPA3-SAE passphrase |
+| `ssid` | string | **required** | HaLow AP SSID (1-32 characters) |
+| `password` | string | *(empty)* | Passphrase, up to 100 characters. Required for `SAE` |
+| `country_code` | string | **required** | Regulatory domain: `AU`, `CA`, `EU`, `GB`, `IN`, `JP`, `KR`, `NZ` or `US`. Must match the AP |
 | `security` | enum | `SAE` | Security type: `SAE` (WPA3), `OWE`, or `OPEN` |
-| `bcf_file` | string | `bcf_mf16858.mbin` | Board configuration file |
+| `type` | enum | `MM6108` | Chip type. Only `MM6108` is supported |
+| `mode` | enum | `STATION` | Operating mode. Only `STATION` is supported |
+| `bcf_file` | string | `bcf_mf16858.mbin` | Board configuration file; checked against the SDK at compile time |
 | `sub_bands` | bool | `false` | `false` = 8 MHz max throughput, `true` = 1-2 MHz max range |
+| `max_tx_power` | int | *(regulatory max)* | Cap TX power, 1-30 dBm. Can only lower power, never exceed the regulatory limit |
 | `manual_ip` | schema | *(DHCP)* | Static IP config (static_ip, gateway, subnet, dns1, dns2) |
-| `country_code` | string | `"US"` | Regulatory domain (US, AU, EU, JP, etc.) |
+| `mm_iot_sdk_path` | string | `~/.esphome/mm-iot-esp32` | Where the MM-IoT-SDK is downloaded / found |
 | `clk_pin` | int | `7` | SPI clock GPIO |
 | `mosi_pin` | int | `9` | SPI MOSI GPIO |
 | `miso_pin` | int | `8` | SPI MISO GPIO |
@@ -268,6 +286,8 @@ but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discov
 | `reset_pin` | int | `1` | Module reset GPIO (active low) |
 | `wake_pin` | int | `2` | Module wake GPIO |
 | `busy_pin` | int | `5` | Module busy GPIO |
+
+Pins must be distinct ESP32-S3 GPIOs (0-48).
 
 ### Sensors
 
@@ -472,16 +492,20 @@ and the `noise_floor` sensor is updated from the scan data.
 ##### `scan_results`
 **Type**: Text sensor (JSON)
 
-JSON array of all APs found during the last channel scan. Each entry includes:
+Compact JSON array of the APs found during the last channel scan, strongest first.
+Home Assistant limits text sensor states to 255 characters, so only as many whole
+entries as fit are included (typically three or four); every result is also written
+to the debug log.
 
 ```json
-[
-  {"ssid":"my-ap","bssid":"50:2E:91:D2:C9:E4","rssi":-41,"noise":-92,"freq":924000,"bw":8}
-]
+[{"ssid":"my-ap","rssi":-41,"noise":-92,"mhz":924.0,"bw":8}]
 ```
 
-Fields: `ssid`, `bssid`, `rssi` (dBm), `noise` (noise floor in dBm),
-`freq` (center frequency in kHz), `bw` (bandwidth in MHz).
+Fields: `ssid`, `rssi` (dBm), `noise` (noise floor in dBm),
+`mhz` (center frequency in MHz), `bw` (bandwidth in MHz).
+
+The `noise_floor` sensor uses the reading from the channel of the AP you're
+connected to, or the quietest channel if your AP wasn't seen.
 
 ```yaml
 scan_channel:
@@ -538,7 +562,7 @@ The SDK is licensed under Apache-2.0 (shims/examples) and a Morse Micro BDL (bin
 
 ## References
 
-- [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) -- **Auto-downloaded by this component** (v2.10.4, native IDF 5.5.2)
+- [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) -- **Auto-downloaded by this component**, pinned to commit `96d9bf4` (morselib 2.10.4)
 - [Seeed MM-IoT-SDK](https://github.com/Seeed-Studio/mm-iot-esp32) -- Seeed fork (v2.6.4, legacy)
 - [Morse Micro morse-firmware](https://github.com/MorseMicro/morse-firmware) -- Additional BCF files for Quectel modules
 - [Morse Micro MM6108 Datasheet](https://www.morsemicro.com/chips/) -- SoC specifications

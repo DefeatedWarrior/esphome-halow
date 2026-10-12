@@ -11,6 +11,8 @@ The upstream [`sweitzja/esphome-halow`](https://github.com/sweitzja/esphome-halo
 
 All four fixes are needed. Every fix is confined to `components/halow/`; the Morse Micro SDK and ESPHome itself are untouched.
 
+[Part 2](#part-2-fixes-from-code-review) covers a second round of fixes from a full review of the component, including one more ESPHome 2026.x break that would have dropped every Home Assistant connection.
+
 ## Test setup
 
 - **ESPHome** 2026.9.1, native ESP-IDF toolchain, ESP-IDF 5.5.5 (the Home Assistant OS builder's default)
@@ -211,7 +213,7 @@ The wrapper lives in `halow_component.cpp` rather than `network_wrap.cpp`. The o
 
 **Not yet verified:**
 
-- **Reaching the device from the main LAN, and the Home Assistant API connection.** The test Mac sat on a different subnet with no route to the HaLow subnet, so this couldn't be checked. It depends on the AP bridging to the LAN; see the upstream README's "Access Point Setup".
+- **Reaching the device from the main LAN, and the Home Assistant API connection.** The test Mac sat on a different subnet with no route to the HaLow subnet, so this couldn't be checked. (Code review later showed the API connection would have failed on 2026.x anyway; see [Part 2, fix 5](#5-esphome-2026x-drops-every-api-connection).) It depends on the AP bridging to the LAN; see the upstream README's "Access Point Setup".
 - **OTA over HaLow**, and recovery after an AP restart or after going out of range.
 - **Long-running stability.**
 - **The PlatformIO toolchain** (`toolchain: platformio`) with these patches. Fixes #1 and #2 should be harmless there. Fix #4 does nothing when only one `tcpip_init()` call is made.
@@ -222,3 +224,96 @@ The wrapper lives in `halow_component.cpp` rather than `network_wrap.cpp`. The o
 components/halow/__init__.py          +5   (CMAC sdkconfig option, --wrap=tcpip_init)
 components/halow/halow_component.cpp  +29 -1  (header path, GPIO disarm, tcpip_init wrapper)
 ```
+
+---
+
+# Part 2: fixes from code review
+
+A full review of the component turned up one more ESPHome 2026.x break and a set of bugs that predate it. All of these are on the `improvements` branch.
+
+**How they were verified:** everything compiles and links on ESPHome 2026.9.1 (59.8% flash, 26.0% RAM with every sensor enabled). Config validation was exercised with good and bad configs. The network patch was confirmed in the build output (the API server's object file calls `halow::network_is_connected()`). The pinned SDK download was run into an empty folder. **None of the runtime behaviour in this part has been tested on hardware yet**: the test board was resetting whenever its radio powered up (a hardware/power fault, see the README's Troubleshooting), so nothing past "Connecting" could be exercised.
+
+| # | Problem | Severity |
+|---|---------|----------|
+| 5 | ESPHome 2026.x drops every API connection | Critical |
+| 6 | Reconnect race between the main loop and the timer | High |
+| 7 | Timer reconnect ignored the configured security type | High |
+| 8 | SSID/password lengths unchecked (buffer overflow) | High |
+| 9 | Morse SDK download not pinned | High |
+| 10 | `mode: AP` and `type: MM8108` accepted but non-functional | Medium |
+| 11 | Scan results exceed Home Assistant's 255-char limit, unsynchronised | Medium |
+| 12 | mDNS teardown discarded ESPHome's discovery records | Medium |
+| 13 | `country_code` silently defaulted to `US` | Medium |
+| 14 | Smaller cleanups | Low |
+
+## 5. ESPHome 2026.x drops every API connection
+
+**Problem.** ESPHome's API server checks `network::is_connected()` on every loop and, if it's false, disconnects all clients ("Network down; disconnect"). With no client ever staying connected it then reboots the device after `reboot_timeout` (15 minutes by default). MQTT, `http_request`, the `status` binary sensor and others use the same check. `is_connected()` only knows ESPHome's built-in interfaces, so the original component overrode it with linker `--wrap`. In ESPHome 2026.x `is_connected()` became `ESPHOME_ALWAYS_INLINE` in `network/util.h`, so there is no symbol to wrap, and `get_use_address()` was replaced by `get_use_address_to()`. All three wraps silently did nothing; `nm` on the firmware shows no `__wrap_` symbols at all.
+
+**Fix.** `_patch_network_util()` in `__init__.py` reads ESPHome's own `network/util.h` and `util.cpp`, inserts a `USE_HALOW` branch at the top of `is_connected()` and `get_ip_addresses()`, and registers the patched copies with `add_extra_build_file()`. ESP32 `copy_files()` runs after ESPHome copies its sources, so they replace the originals in the build tree. Because it patches whatever ESPHome version is installed, it should survive minor changes; if it can't find the functions it stops the build with a clear error instead of producing firmware that drops connections. `network_wrap.cpp` and its `--wrap` flags are removed. `get_use_address_to()` needs no hook, since it already returns `<name>.local`.
+
+```cpp
+ESPHOME_ALWAYS_INLINE inline bool is_connected() {
+#ifdef USE_HALOW
+  if (halow::network_is_connected())
+    return true;
+#endif  // USE_HALOW
+  ...
+```
+
+## 6. Reconnect race
+
+**Problem.** When the link dropped, `loop()` moved to `CONNECTING` without resetting the connect timer, so on the next pass the 60 s timeout had already "expired". It went to `STOPPED` and called `mmwlan_sta_enable()` from the main loop 5 s later, while the FreeRTOS timer the link-down callback had started did `sta_disable()` + `sta_enable()` 10 s after that. Two tasks were driving the radio at once, and the main-loop call is exactly what the author's own notes say wedges the SDK.
+
+**Fix.** After the initial connect in `setup()`, only the timer task calls `mmwlan_sta_disable/enable`. `loop()` tracks the time of the last attempt (`s_last_attempt_ms`, updated by every `sta_enable` call and reset on link loss), and on a timeout it only schedules the timer if it isn't already pending (`schedule_reconnect()`). The `STOPPED` retry path is gone. The timer task's stack is raised to 4096 bytes (`CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH`), since these SDK calls and their logging now run on it.
+
+## 7. Timer reconnect ignored `security`
+
+**Problem.** `do_halow_reconnect()` hardcoded `MMWLAN_SAE`, so `OWE` and `OPEN` networks could connect once but never reconnect.
+
+**Fix.** The initial connect and the reconnect now both build their arguments with `fill_sta_args()`, which uses the configured security type.
+
+## 8. SSID/password lengths unchecked
+
+**Problem.** The SSID and passphrase were `memcpy`'d into the SDK's fixed 32- and 100-byte buffers using the string's length, and the schema accepted any length. A 33+ character SSID overwrote the stack.
+
+**Fix.** The schema limits `ssid` to 1–32 and `password` to 100 characters, and `fill_sta_args()` clamps to the buffer sizes as well. `password` is now optional (it isn't used for `OPEN`/`OWE`) but required for `SAE`.
+
+## 9. Morse SDK download not pinned
+
+**Problem.** The SDK was fetched with `git clone --depth 1` of whatever was on the default branch. Any new Morse commit could change the firmware or break the build, and the HAOS add-on can wipe `/root/.esphome` on updates, which triggers a fresh clone.
+
+**Fix.** The download now fetches exactly `MM_IOT_SDK_COMMIT` (`96d9bf4`, morselib 2.10.4, firmware 1.17.6). An existing checkout at a different commit logs a warning. The BCF file name is also checked against the SDK at compile time.
+
+## 10. `mode: AP` and `type: MM8108`
+
+**Problem.** Both were accepted and documented, but there is no AP code at all, and `MM8108` still loaded `mm6108.mbin` with an MM6108 board config.
+
+**Fix.** Config validation rejects them with an explanation. The README lists station mode and MM6108 as the supported configuration.
+
+## 11. Scan results
+
+**Problem.** The scan JSON listed every AP with long field names, which easily exceeds Home Assistant's 255-character text sensor limit. The string was also appended to from the SDK's task while the main loop read and cleared it, with no lock. The noise floor kept the *highest* (worst) reading, contradicting its comment.
+
+**Fix.** Results are collected into a mutex-protected list (capped at 32). On completion they are sorted strongest first and published as compact JSON (`ssid`, `rssi`, `noise`, `mhz`, `bw`), stopping at the last whole entry that fits in 255 characters. SSIDs are sanitised for JSON. The noise floor comes from the channel of the connected AP, or the quietest channel if that AP wasn't seen. Every result is still written to the debug log.
+
+## 12. mDNS
+
+**Problem.** `start_mdns_()` called `mdns_free()` and re-initialised the responder, discarding the services ESPHome's mdns component had registered, along with their full TXT records (`mac`, `friendly_name`, `api_encryption`, ...). It then re-added a minimal `_esphomelib._tcp` record. Nothing was re-announced after a reconnect.
+
+**Fix.** `mdns_init()` is a no-op when ESPHome has already started the responder, so the component no longer frees it; it registers its HaLow netif wrapper alongside ESPHome's services. `_esphomelib._tcp` is only added (now with `mac` and `friendly_name`) if ESPHome didn't register it. On reconnects the address is re-announced.
+
+## 13. `country_code` default
+
+**Problem.** `country_code` defaulted to `US` and wasn't validated. A device outside the US that omitted it couldn't find its AP, which is what happened during testing, and would transmit on the wrong band.
+
+**Fix.** `country_code` is required and must be one of the regions in the pinned SDK's regulatory database: `AU`, `CA`, `EU`, `GB`, `IN`, `JP`, `KR`, `NZ`, `US` (case-insensitive).
+
+## 14. Smaller changes
+
+- **New `max_tx_power` option** (1–30 dBm), using `mmwlan_override_max_tx_power()`. It can only lower power below the regulatory limit.
+- Pins are validated as distinct ESP32-S3 GPIOs (0–48).
+- Removed the unused `full_radio_reset_()`, the unused traffic-watchdog members and `set_scan_button()`.
+- `sta_status_cb` bounds-checks the state before indexing its name table.
+- Removed the `-I~/.platformio/...` include path (superseded by fix 1). `pre_build.py` is only registered for the PlatformIO toolchain.
+- README: pin table fixed (five XIAO labels were off by one), Troubleshooting section added, configuration table and scan-result docs updated, ESP32-C6 marked unsupported.

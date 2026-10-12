@@ -2,9 +2,11 @@
 
 import logging
 import os
-import esphome.codegen as cg
+import re
+import subprocess
+from pathlib import Path
 
-_LOGGER = logging.getLogger(__name__)
+import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ID,
@@ -16,8 +18,14 @@ from esphome.const import (
     STATE_CLASS_TOTAL_INCREASING,
     UNIT_DECIBEL_MILLIWATT,
 )
-from esphome.core import coroutine_with_priority, CORE
-from esphome.components.esp32 import add_idf_sdkconfig_option, add_idf_component
+from esphome.core import coroutine_with_priority, CORE, EsphomeError
+from esphome.components.esp32 import (
+    add_extra_build_file,
+    add_idf_component,
+    add_idf_sdkconfig_option,
+)
+
+_LOGGER = logging.getLogger(__name__)
 
 DEPENDENCIES = ["esp32"]
 AUTO_LOAD = ["network", "sensor", "text_sensor", "button"]
@@ -70,8 +78,69 @@ CONF_FW_VERSION_SENSOR = "firmware_version"
 CONF_TYPE = "type"
 CONF_MODE = "mode"
 
-CHIP_TYPES = {"MM6108": "MM6108", "MM8108": "MM8108"}
-MODE_TYPES = {"STATION": "STATION", "AP": "AP"}
+CONF_MAX_TX_POWER = "max_tx_power"
+
+# Morse Micro MM-IoT-SDK, pinned to the commit this component is tested against
+# (morselib 2.10.4-esp32, MM6108 firmware 1.17.6). Bump deliberately.
+MM_IOT_SDK_REPO = "https://github.com/MorseMicro/mm-iot-esp32.git"
+MM_IOT_SDK_COMMIT = "96d9bf43616347e39789081e877ba5224f6bff8d"
+DEFAULT_SDK_PATH = "~/.esphome/mm-iot-esp32"
+
+# Country codes with S1G channel lists in the pinned SDK's regulatory database
+# (framework/src/mmregdb/mmregdb.c)
+COUNTRY_CODES = ["AU", "CA", "EU", "GB", "IN", "JP", "KR", "NZ", "US"]
+
+ESP32S3_MAX_GPIO = 48
+
+
+def _validate_chip_type(value):
+    value = cv.string_strict(value).upper()
+    if value == "MM8108":
+        raise cv.Invalid(
+            "MM8108 is not supported yet: the component only loads MM6108 firmware "
+            "and board configuration"
+        )
+    if value != "MM6108":
+        raise cv.Invalid("type must be MM6108")
+    return value
+
+
+def _validate_mode(value):
+    value = cv.string_strict(value).upper()
+    if value != "STATION":
+        raise cv.Invalid("Only STATION mode is supported (AP mode is not implemented)")
+    return value
+
+
+def _validate_country_code(value):
+    value = cv.string_strict(value).upper()
+    if value not in COUNTRY_CODES:
+        raise cv.Invalid(
+            f"Unsupported country code '{value}'. HaLow channel plans are region "
+            f"specific; supported: {', '.join(COUNTRY_CODES)}"
+        )
+    return value
+
+
+def _validate_config(config):
+    if config[CONF_SECURITY] == "SAE" and not config[CONF_PASSWORD]:
+        raise cv.Invalid("A password is required for SAE (WPA3) security", [CONF_PASSWORD])
+    seen = {}
+    for key in (
+        CONF_CLK_PIN,
+        CONF_MOSI_PIN,
+        CONF_MISO_PIN,
+        CONF_CS_PIN,
+        CONF_IRQ_PIN,
+        CONF_RESET_PIN,
+        CONF_WAKE_PIN,
+        CONF_BUSY_PIN,
+    ):
+        pin = config[key]
+        if pin in seen:
+            raise cv.Invalid(f"GPIO{pin} is used for both {seen[pin]} and {key}", [key])
+        seen[pin] = key
+    return config
 
 halow_ns = cg.esphome_ns.namespace("halow")
 HalowComponent = halow_ns.class_("HalowComponent", cg.Component)
@@ -117,35 +186,51 @@ CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(HalowComponent),
-            cv.Optional(CONF_TYPE, default="MM6108"): cv.enum(
-                CHIP_TYPES, upper=True
+            cv.Optional(CONF_TYPE, default="MM6108"): _validate_chip_type,
+            cv.Optional(CONF_MODE, default="STATION"): _validate_mode,
+            cv.Required(CONF_SSID): cv.All(cv.string, cv.Length(min=1, max=32)),
+            cv.Optional(CONF_PASSWORD, default=""): cv.All(
+                cv.string, cv.Length(max=100)
             ),
-            cv.Optional(CONF_MODE, default="STATION"): cv.enum(
-                MODE_TYPES, upper=True
-            ),
-            cv.Required(CONF_SSID): cv.string,
-            cv.Required(CONF_PASSWORD): cv.string,
-            cv.Optional(CONF_COUNTRY_CODE, default="US"): cv.string_strict,
+            # Required: HaLow channel plans differ per region and the radio must use
+            # the one the AP (and local law) uses
+            cv.Required(CONF_COUNTRY_CODE): _validate_country_code,
             cv.Optional(CONF_SECURITY, default="SAE"): cv.enum(
                 SECURITY_TYPES, upper=True
             ),
             cv.Optional(
                 CONF_BCF_FILE, default="bcf_mf16858.mbin"
             ): cv.string_strict,
-            cv.Optional(
-                CONF_MM_IOT_SDK_PATH, default="~/.esphome/mm-iot-esp32"
-            ): cv.string,
+            cv.Optional(CONF_MM_IOT_SDK_PATH, default=DEFAULT_SDK_PATH): cv.string,
             cv.Optional(CONF_SUB_BANDS, default=False): cv.boolean,
+            # Cap TX power below the regulatory maximum (dBm)
+            cv.Optional(CONF_MAX_TX_POWER): cv.int_range(min=1, max=30),
             cv.Optional(CONF_MANUAL_IP): MANUAL_IP_SCHEMA,
             # SPI pins — defaults match XIAO HaLow Hat
-            cv.Optional(CONF_CLK_PIN, default=7): cv.int_,
-            cv.Optional(CONF_MOSI_PIN, default=9): cv.int_,
-            cv.Optional(CONF_MISO_PIN, default=8): cv.int_,
-            cv.Optional(CONF_CS_PIN, default=4): cv.int_,
-            cv.Optional(CONF_IRQ_PIN, default=3): cv.int_,
-            cv.Optional(CONF_RESET_PIN, default=1): cv.int_,
-            cv.Optional(CONF_WAKE_PIN, default=2): cv.int_,
-            cv.Optional(CONF_BUSY_PIN, default=5): cv.int_,
+            cv.Optional(CONF_CLK_PIN, default=7): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_MOSI_PIN, default=9): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_MISO_PIN, default=8): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_CS_PIN, default=4): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_IRQ_PIN, default=3): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_RESET_PIN, default=1): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_WAKE_PIN, default=2): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
+            cv.Optional(CONF_BUSY_PIN, default=5): cv.int_range(
+                min=0, max=ESP32S3_MAX_GPIO
+            ),
             # Numeric sensors
             cv.Optional(CONF_RSSI_SENSOR): _sensor_schema(
                 unit_of_measurement=UNIT_DECIBEL_MILLIWATT,
@@ -276,6 +361,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ),
     cv.only_on_esp32,
+    _validate_config,
 )
 
 
@@ -290,6 +376,8 @@ async def to_code(config):
     cg.add(var.set_country_code(config[CONF_COUNTRY_CODE]))
     cg.add(var.set_security_type(config[CONF_SECURITY]))
     cg.add(var.set_sub_bands_enabled(config[CONF_SUB_BANDS]))
+    if CONF_MAX_TX_POWER in config:
+        cg.add(var.set_max_tx_power(config[CONF_MAX_TX_POWER]))
 
     # Pin configuration
     cg.add(var.set_spi_clk_pin(config[CONF_CLK_PIN]))
@@ -362,28 +450,8 @@ async def to_code(config):
 
     # --- MM-IoT-SDK Integration ---
 
-    # Resolve and auto-download SDK if needed
-    MM_IOT_SDK_REPO = "https://github.com/MorseMicro/mm-iot-esp32.git"
-
-    sdk_path = os.path.expanduser(config[CONF_MM_IOT_SDK_PATH])
-    sdk_path = os.path.abspath(sdk_path)
-    framework_path = os.path.join(sdk_path, "framework")
-
-    if not os.path.isdir(framework_path):
-        import subprocess
-
-        _LOGGER.info("Downloading MM-IoT-SDK to %s ...", sdk_path)
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", MM_IOT_SDK_REPO, sdk_path],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise cv.Invalid(
-                f"Failed to download MM-IoT-SDK: {result.stderr.strip()}\n"
-                f"Manually clone: git clone {MM_IOT_SDK_REPO} {sdk_path}"
-            )
-        _LOGGER.info("MM-IoT-SDK downloaded successfully")
+    sdk_path = os.path.abspath(os.path.expanduser(config[CONF_MM_IOT_SDK_PATH]))
+    framework_path = _ensure_sdk(sdk_path)
 
     # Register IDF components
     components = [
@@ -417,6 +485,13 @@ async def to_code(config):
         kconfig_content = f.read()
     if "MM_BCF_FILE" in kconfig_content:
         # Upstream SDK: string-based BCF/FW config
+        bcf_dir = os.path.join(framework_path, "morsefirmware", "mm6108", "bcfs")
+        if not os.path.isfile(os.path.join(bcf_dir, config[CONF_BCF_FILE])):
+            available = sorted(os.listdir(bcf_dir)) if os.path.isdir(bcf_dir) else []
+            raise EsphomeError(
+                f"BCF file '{config[CONF_BCF_FILE]}' not found in the MM-IoT-SDK. "
+                f"Available: {', '.join(available)}"
+            )
         add_idf_sdkconfig_option("CONFIG_MM_BCF_FILE", config[CONF_BCF_FILE])
         add_idf_sdkconfig_option("CONFIG_MM_FW_FILE", "mm6108.mbin")
     else:
@@ -430,16 +505,15 @@ async def to_code(config):
             add_idf_sdkconfig_option("CONFIG_MM_BCF_MF08551", True)
         elif "mf08251" in bcf:
             add_idf_sdkconfig_option("CONFIG_MM_BCF_MF08251", True)
-    # Chip type
-    chip_type = config[CONF_TYPE]
-    if chip_type == "MM8108":
-        add_idf_sdkconfig_option("CONFIG_MMHAL_CHIP_TYPE_MM8108", True)
-    else:
-        add_idf_sdkconfig_option("CONFIG_MMHAL_CHIP_TYPE_MM6108", True)
+    # Chip type (only MM6108 passes validation)
+    add_idf_sdkconfig_option("CONFIG_MMHAL_CHIP_TYPE_MM6108", True)
 
     # Kconfig: FreeRTOS
     add_idf_sdkconfig_option("CONFIG_FREERTOS_HZ", 1000)
     add_idf_sdkconfig_option("CONFIG_FREERTOS_TIMER_TASK_PRIORITY", 10)
+    # Reconnects (mmwlan_sta_disable/enable + logging) run in the timer task;
+    # the IDF default stack is too small for that
+    add_idf_sdkconfig_option("CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH", 4096)
 
     # Kconfig: ESP32-S3
     add_idf_sdkconfig_option("CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB", True)
@@ -458,22 +532,9 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_MDNS_PREDEF_NETIF_AP", False)
     add_idf_sdkconfig_option("CONFIG_MDNS_PREDEF_NETIF_ETH", False)
 
-    # Include path for esp_netif internal header (needed for mDNS netif wrapper).
-    # The esp_netif_lwip_internal.h header defines struct esp_netif_obj which we
-    # need to create a minimal wrapper around mmipal's raw LWIP netif.
-    esp_netif_internal = os.path.join(
-        os.path.expanduser("~/.platformio"), "packages", "framework-espidf",
-        "components", "esp_netif", "lwip"
-    )
-    if os.path.isdir(esp_netif_internal):
-        cg.add_build_flag(f"-I{esp_netif_internal}")
-
-    # Wrap network utility functions so ESPHome's API/OTA components
-    # recognize halow as a valid network provider. Without this,
-    # network::is_connected() returns false and API clients get disconnected.
-    cg.add_build_flag("-Wl,--wrap=_ZN7esphome7network12is_connectedEv")
-    cg.add_build_flag("-Wl,--wrap=_ZN7esphome7network16get_ip_addressesEv")
-    cg.add_build_flag("-Wl,--wrap=_ZN7esphome7network15get_use_addressEv")
+    # Make ESPHome's network::is_connected() / get_ip_addresses() aware of HaLow,
+    # so the API, MQTT, OTA etc. see the network as up
+    _patch_network_util()
 
     # Wrap tcpip_input for RX byte counting — the SDK calls tcpip_input()
     # directly instead of going through netif->input
@@ -483,8 +544,127 @@ async def to_code(config):
     # that ESPHome's network component already started
     cg.add_build_flag("-Wl,--wrap=tcpip_init")
 
-    # PlatformIO extra script for firmware blob generation
-    cg.add_platformio_option(
-        "extra_scripts",
-        [os.path.join(os.path.dirname(__file__), "pre_build.py")],
+    # Firmware blob generation for the (deprecated) PlatformIO toolchain; the
+    # native ESP-IDF toolchain embeds the blobs via the SDK's CMakeLists
+    if getattr(CORE, "using_toolchain_platformio", True):
+        cg.add_platformio_option(
+            "extra_scripts",
+            [os.path.join(os.path.dirname(__file__), "pre_build.py")],
+        )
+
+
+def _git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def _ensure_sdk(sdk_path):
+    """Download the pinned MM-IoT-SDK if needed and return its framework path."""
+    framework_path = os.path.join(sdk_path, "framework")
+    if not os.path.isdir(framework_path):
+        _LOGGER.info(
+            "Downloading MM-IoT-SDK %s to %s ...", MM_IOT_SDK_COMMIT[:7], sdk_path
+        )
+        os.makedirs(sdk_path, exist_ok=True)
+        steps = [
+            ("init", "-q"),
+            ("remote", "add", "origin", MM_IOT_SDK_REPO),
+            ("fetch", "-q", "--depth", "1", "origin", MM_IOT_SDK_COMMIT),
+            ("checkout", "-q", "FETCH_HEAD"),
+        ]
+        for step in steps:
+            result = _git(*step, cwd=sdk_path)
+            if result.returncode != 0:
+                raise EsphomeError(
+                    f"Failed to download MM-IoT-SDK (git {step[0]}): "
+                    f"{result.stderr.strip()}\nManually run: git clone "
+                    f"{MM_IOT_SDK_REPO} {sdk_path} && git -C {sdk_path} checkout "
+                    f"{MM_IOT_SDK_COMMIT}"
+                )
+        _LOGGER.info("MM-IoT-SDK downloaded successfully")
+        return framework_path
+
+    head = _git("rev-parse", "HEAD", cwd=sdk_path)
+    if head.returncode == 0 and head.stdout.strip() != MM_IOT_SDK_COMMIT:
+        _LOGGER.warning(
+            "MM-IoT-SDK at %s is at %s, but this component is tested with %s. "
+            "Delete that folder to re-download the tested version.",
+            sdk_path,
+            head.stdout.strip()[:7],
+            MM_IOT_SDK_COMMIT[:7],
+        )
+    return framework_path
+
+
+_HALOW_DECL = (
+    "\n#ifdef USE_HALOW\n"
+    "namespace esphome {\nnamespace halow {\n"
+    "bool network_is_connected();\n"
+    "network::IPAddresses network_get_ip_addresses();\n"
+    "}  // namespace halow\n}  // namespace esphome\n"
+    "#endif  // USE_HALOW\n\n"
+)
+_IS_CONNECTED_HOOK = (
+    "\n#ifdef USE_HALOW\n"
+    "  if (halow::network_is_connected())\n    return true;\n"
+    "#endif  // USE_HALOW\n"
+)
+_GET_IPS_HOOK = (
+    "\n#ifdef USE_HALOW\n"
+    "  if (halow::network_is_connected())\n"
+    "    return halow::network_get_ip_addresses();\n"
+    "#endif  // USE_HALOW\n"
+)
+_NAMESPACE_RE = re.compile(r"^namespace esphome(::network)? \{", re.MULTILINE)
+
+
+def _patch_network_util():
+    """Splice HaLow into ESPHome's network::is_connected() and get_ip_addresses().
+
+    ESPHome only knows its built-in interfaces (wifi, ethernet, modem, ...) and,
+    since 2026.x, inlines is_connected() into every caller, so it can't be
+    overridden at link time. Instead, copies of network/util.h and util.cpp with
+    a USE_HALOW branch are written into the build tree after ESPHome copies its
+    own sources. If ESPHome restructures these files the build fails here, loudly,
+    rather than producing firmware that drops every API connection.
+    """
+    import esphome.components.network as network_component
+
+    src_dir = Path(network_component.__file__).parent
+    patched = {}
+    for name in ("util.h", "util.cpp"):
+        path = src_dir / name
+        if path.is_file():
+            patched[name] = path.read_text(encoding="utf-8")
+
+    def add_hook(pattern, hook, what):
+        for name, text in patched.items():
+            match = re.search(pattern, text)
+            if match is None:
+                continue
+            ns = _NAMESPACE_RE.search(text)
+            if ns is None or ns.start() > match.start():
+                break
+            text = text[: match.end()] + hook + text[match.end() :]
+            if _HALOW_DECL not in text:
+                text = text[: ns.start()] + _HALOW_DECL + text[ns.start() :]
+            patched[name] = text
+            return
+        raise EsphomeError(
+            f"halow: could not find {what} in ESPHome's network component "
+            f"({src_dir}). This ESPHome version is not supported yet."
+        )
+
+    add_hook(r"\bbool is_connected\(\) \{", _IS_CONNECTED_HOOK, "is_connected()")
+    add_hook(
+        r"\bIPAddresses get_ip_addresses\(\) \{",
+        _GET_IPS_HOOK,
+        "get_ip_addresses()",
     )
+
+    out_dir = Path(CORE.relative_build_path("halow_patches"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in patched.items():
+        out = out_dir / name
+        if not out.is_file() or out.read_text(encoding="utf-8") != text:
+            out.write_text(text, encoding="utf-8")
+        add_extra_build_file(f"src/esphome/components/network/{name}", out)

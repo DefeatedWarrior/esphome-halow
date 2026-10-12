@@ -6,11 +6,16 @@
  *
  * State machine: STOPPED -> CONNECTING -> CONNECTED (with auto-reconnect)
  * SDK callbacks fire from FreeRTOS tasks; we use volatile flags polled in loop().
+ * After the initial connect in setup(), every mmwlan_sta_disable/enable call is
+ * made from the reconnect timer task — loop() only ever schedules that timer.
  */
 
 #include "halow_component.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+
+#include <algorithm>
+#include <vector>
 
 // MM-IoT-SDK headers
 extern "C" {
@@ -32,7 +37,9 @@ extern "C" {
 #include "driver/spi_master.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "soc/periph_defs.h"
+#include "freertos/semphr.h"
 #include "lwip/netif.h"
 #include "lwip/tcpip.h"
 #include "mdns.h"
@@ -64,9 +71,12 @@ static volatile bool s_link_down_event = false;
 static volatile bool s_sta_connected = false;
 static volatile bool s_reconnecting = false;
 static TimerHandle_t s_reconnect_timer = nullptr;
+// millis() of the last mmwlan_sta_enable() call; loop() uses it for the connect timeout
+static volatile uint32_t s_last_attempt_ms = 0;
 
-// Forward declaration
+// Forward declarations
 static void do_halow_reconnect(TimerHandle_t t);
+static void schedule_reconnect();
 
 static void link_state_cb(enum mmwlan_link_state state, void *arg) {
   s_link_up = (state == MMWLAN_LINK_UP);
@@ -89,18 +99,51 @@ static void mmipal_link_status_cb(const struct mmipal_link_status *status) {
     s_link_down_event = true;
     ESP_LOGW(TAG, "mmipal link DOWN");
     // Start reconnect timer (15 seconds) — same approach as Xiao-Halow-to-WiFi-Bridge
-    if (!s_reconnecting && s_reconnect_timer != nullptr) {
-      if (xTimerStart(s_reconnect_timer, 0) == pdPASS) {
-        ESP_LOGI(TAG, "Reconnect scheduled in 15s");
-      }
+    if (!s_reconnecting) {
+      schedule_reconnect();
     }
   }
 }
 
 static void sta_status_cb(enum mmwlan_sta_state state) {
-  const char *states[] = {"DISABLED", "CONNECTING", "CONNECTED"};
-  ESP_LOGI(TAG, "STA state: %s", states[state]);
+  static const char *const STATES[] = {"DISABLED", "CONNECTING", "CONNECTED"};
+  const unsigned idx = (unsigned) state;
+  ESP_LOGI(TAG, "STA state: %s", idx < 3 ? STATES[idx] : "UNKNOWN");
   s_sta_connected = (state == MMWLAN_STA_CONNECTED);
+}
+
+// Build STA arguments from the component config. Shared by the initial connect
+// and the timer-driven reconnect so both honour the configured security type.
+// Lengths are clamped to the SDK buffers (the YAML schema also enforces them).
+static void fill_sta_args(const HalowComponent *comp, struct mmwlan_sta_args *args) {
+  const std::string &security = comp->get_security_type();
+  size_t ssid_len = std::min<size_t>(strlen(comp->get_ssid()), MMWLAN_SSID_MAXLEN);
+  args->ssid_len = ssid_len;
+  memcpy(args->ssid, comp->get_ssid(), ssid_len);
+
+  if (security != "OPEN") {
+    size_t pass_len = std::min<size_t>(strlen(comp->get_password()), MMWLAN_PASSPHRASE_MAXLEN);
+    args->passphrase_len = pass_len;
+    memcpy(args->passphrase, comp->get_password(), pass_len);
+    args->passphrase[pass_len] = '\0';
+  }
+
+  if (security == "OWE") {
+    args->security_type = MMWLAN_OWE;
+  } else if (security == "OPEN") {
+    args->security_type = MMWLAN_OPEN;
+  } else {
+    args->security_type = MMWLAN_SAE;
+  }
+}
+
+// Ask the timer task to (re)connect, unless a reconnect is already queued.
+static void schedule_reconnect() {
+  if (s_reconnect_timer != nullptr && xTimerIsTimerActive(s_reconnect_timer) == pdFALSE) {
+    if (xTimerStart(s_reconnect_timer, 0) == pdPASS) {
+      ESP_LOGI(TAG, "Reconnect scheduled in 15s");
+    }
+  }
 }
 
 // Reconnect handler — runs from FreeRTOS timer task, NOT main loop
@@ -130,12 +173,7 @@ static void do_halow_reconnect(TimerHandle_t t) {
     s_reconnecting = false;
     return;
   }
-
-  sta_args.ssid_len = strlen(comp->get_ssid());
-  memcpy(sta_args.ssid, comp->get_ssid(), sta_args.ssid_len);
-  sta_args.passphrase_len = strlen(comp->get_password());
-  memcpy(sta_args.passphrase, comp->get_password(), sta_args.passphrase_len);
-  sta_args.security_type = MMWLAN_SAE;
+  fill_sta_args(comp, &sta_args);
 
   // Reset flags
   s_link_up = false;
@@ -143,6 +181,7 @@ static void do_halow_reconnect(TimerHandle_t t) {
   s_sta_connected = false;
 
   ESP_LOGI(TAG, "sta_enable from timer...");
+  s_last_attempt_ms = millis();
   status = mmwlan_sta_enable(&sta_args, sta_status_cb);
   if (status != MMWLAN_SUCCESS) {
     ESP_LOGW(TAG, "sta_enable failed (%d), retrying in 15s", status);
@@ -155,9 +194,19 @@ static void do_halow_reconnect(TimerHandle_t t) {
 }
 
 // --- Channel Scan State ---
-static std::string s_scan_json;
-static volatile int8_t s_scan_noise_dbm = 0;
-static volatile bool s_scan_has_noise = false;
+// Results arrive on the SDK's task; loop() publishes them once the scan completes.
+struct ScanEntry {
+  char ssid[MMWLAN_SSID_MAXLEN + 1];
+  uint8_t bssid[6];
+  int16_t rssi;
+  int8_t noise_dbm;
+  uint32_t freq_hz;
+  uint8_t bw_mhz;
+};
+static const size_t MAX_SCAN_ENTRIES = 32;
+static const size_t MAX_TEXT_SENSOR_LEN = 255;  // Home Assistant state length limit
+static std::vector<ScanEntry> s_scan_entries;
+static SemaphoreHandle_t s_scan_lock = nullptr;
 static volatile bool s_scan_complete = false;
 static volatile bool s_scan_running = false;
 
@@ -272,6 +321,17 @@ void HalowComponent::setup() {
   mmhal_init();
   mmwlan_init();
 
+  // Optional TX power cap. Must be set after mmwlan_init() and before the radio is
+  // active; the SDK can only lower power below the regulatory limit, never raise it.
+  if (this->max_tx_power_dbm_ > 0) {
+    enum mmwlan_status tx_status = mmwlan_override_max_tx_power(this->max_tx_power_dbm_);
+    if (tx_status == MMWLAN_SUCCESS) {
+      ESP_LOGI(TAG, "Max TX power capped at %u dBm", this->max_tx_power_dbm_);
+    } else {
+      ESP_LOGW(TAG, "Could not set max TX power (%d)", (int) tx_status);
+    }
+  }
+
   // Set regulatory domain
   const struct mmwlan_s1g_channel_list *channel_list =
       mmwlan_lookup_regulatory_domain(get_regulatory_db(), this->country_code_.c_str());
@@ -355,6 +415,8 @@ void HalowComponent::setup() {
     ESP_LOGW(TAG, "Could not create reconnect timer");
   }
 
+  s_scan_lock = xSemaphoreCreateMutex();
+
   this->setup_complete_ = true;
   this->state_ = HalowState::CONNECTING;
   this->start_connect_();
@@ -362,22 +424,7 @@ void HalowComponent::setup() {
 
 void HalowComponent::start_connect_() {
   struct mmwlan_sta_args sta_args = MMWLAN_STA_ARGS_INIT;
-
-  sta_args.ssid_len = this->ssid_.length();
-  memcpy(sta_args.ssid, this->ssid_.c_str(), sta_args.ssid_len);
-
-  if (this->security_type_ != "OPEN") {
-    sta_args.passphrase_len = this->password_.length();
-    memcpy(sta_args.passphrase, this->password_.c_str(), sta_args.passphrase_len);
-  }
-
-  if (this->security_type_ == "OWE") {
-    sta_args.security_type = MMWLAN_OWE;
-  } else if (this->security_type_ == "OPEN") {
-    sta_args.security_type = MMWLAN_OPEN;
-  } else {
-    sta_args.security_type = MMWLAN_SAE;
-  }
+  fill_sta_args(this, &sta_args);
 
   // Reset connection state flags
   s_link_up = false;
@@ -386,47 +433,11 @@ void HalowComponent::start_connect_() {
 
   ESP_LOGI(TAG, "Connecting to '%s' (%s)...", this->ssid_.c_str(), this->security_type_.c_str());
 
+  s_last_attempt_ms = millis();
   enum mmwlan_status status = mmwlan_sta_enable(&sta_args, sta_status_cb);
   if (status != MMWLAN_SUCCESS) {
     ESP_LOGE(TAG, "STA enable failed: %d", status);
-    return;
   }
-
-  this->connect_start_time_ = millis();
-}
-
-void HalowComponent::full_radio_reset_() {
-  // Nuclear reset: completely shut down and reinitialize the WLAN stack.
-  // This is needed when the radio is stuck after walking out of range —
-  // simple sta_enable() can't recover because the SDK's internal state
-  // machine is wedged waiting for a response from a gone AP.
-  ESP_LOGW(TAG, "=== FULL RADIO RESET ===");
-
-  // 1. Disable STA (may fail if already in bad state, that's OK)
-  mmwlan_sta_disable();
-
-  // 2. Shut down the WLAN stack (powers down the MM6108)
-  enum mmwlan_status status = mmwlan_shutdown();
-  ESP_LOGI(TAG, "mmwlan_shutdown: %d", status);
-
-  // 3. Hardware reset the MM6108 via RESET_N pin
-  gpio_set_level((gpio_num_t) this->reset_pin_, 0);
-  vTaskDelay(pdMS_TO_TICKS(100));
-  gpio_set_level((gpio_num_t) this->reset_pin_, 1);
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  // 4. Re-boot the MM6108 (reload firmware + BCF over SPI)
-  struct mmwlan_boot_args boot_args = MMWLAN_BOOT_ARGS_INIT;
-  status = mmwlan_boot(&boot_args);
-  if (status != MMWLAN_SUCCESS) {
-    ESP_LOGE(TAG, "mmwlan_boot failed after reset: %d", status);
-    return;
-  }
-
-  // 5. Disable power save again
-  mmwlan_set_power_save_mode(MMWLAN_PS_DISABLED);
-
-  ESP_LOGI(TAG, "Radio reset complete, ready to reconnect");
 }
 
 bool HalowComponent::check_ip_() {
@@ -460,15 +471,12 @@ void HalowComponent::loop() {
         this->state_ = HalowState::CONNECTED;
         if (this->reconnect_count_ > 0) {
           uint32_t downtime_s = (millis() - this->disconnect_time_) / 1000;
-          ESP_LOGI(TAG, "=== LINK RECOVERED === after %lus downtime (was attempt %lu)",
-                   (unsigned long) downtime_s, this->reconnect_count_);
+          ESP_LOGI(TAG, "=== LINK RECOVERED === after %lus downtime (%lu attempts)",
+                   (unsigned long) downtime_s, (unsigned long) this->reconnect_count_);
         }
         this->reconnect_count_ = 0;
         ESP_LOGI(TAG, "HaLow connected to '%s'", this->ssid_.c_str());
         this->last_sensor_update_ = 0;  // Force immediate sensor update
-        this->last_rx_check_time_ = millis();  // Reset traffic watchdog
-        this->last_rx_packets_ = 0;
-        this->weak_rssi_count_ = 0;
 
         // Ensure the LWIP netif link is marked UP so ARP responses work.
         // Must hold the LWIP core lock — netif_set_link_up asserts this on IDF 5.5.
@@ -496,30 +504,23 @@ void HalowComponent::loop() {
           UNLOCK_TCPIP_CORE();
         }
 
-        if (!this->mdns_started_) {
-          this->start_mdns_();
-        }
-      } else if (millis() - this->connect_start_time_ > CONNECT_TIMEOUT_MS) {
-        // Timeout — the FreeRTOS reconnect timer should be handling this,
-        // but if we're stuck in CONNECTING, go to STOPPED to let it retry
+        // First connection registers the interface with mDNS; later ones re-announce
+        this->start_mdns_();
+      } else if (millis() - s_last_attempt_ms > CONNECT_TIMEOUT_MS) {
+        // No link within the timeout. Hand the retry to the reconnect timer rather
+        // than calling the SDK from here: sta_disable/enable from the main loop can
+        // wedge the SDK, and the timer task serialises all reconnect attempts.
         this->reconnect_count_++;
-        ESP_LOGW(TAG, "Connect timeout (attempt %lu), waiting for timer retry...",
-                 this->reconnect_count_);
-        this->connect_start_time_ = millis();
-        this->state_ = HalowState::STOPPED;
+        ESP_LOGW(TAG, "Connect timeout (attempt %lu)", (unsigned long) this->reconnect_count_);
+        s_last_attempt_ms = millis();  // the timer refreshes this when it actually retries
+        s_reconnecting = false;
+        schedule_reconnect();
       }
       break;
     }
 
-    case HalowState::STOPPED: {
-      // Wait 5 seconds after disconnect before retrying — gives radio time to settle
-      if (this->setup_complete_ && millis() - this->connect_start_time_ > 5000) {
-        ESP_LOGI(TAG, "Attempting reconnect...");
-        this->state_ = HalowState::CONNECTING;
-        this->start_connect_();
-      }
+    case HalowState::STOPPED:
       break;
-    }
 
     case HalowState::CONNECTED: {
       // Disconnect detection: mmipal link_status_callback handles reconnection
@@ -527,6 +528,8 @@ void HalowComponent::loop() {
       if (s_link_down_event || s_reconnecting) {
         this->state_ = HalowState::CONNECTING;
         this->ip_addresses_ = {};
+        // Start the connect timeout from the moment the link was lost
+        s_last_attempt_ms = millis();
         if (s_link_down_event) {
           this->reconnect_count_++;
           this->disconnect_time_ = millis();
@@ -544,19 +547,7 @@ void HalowComponent::loop() {
         if (s_scan_complete && s_scan_running) {
           s_scan_running = false;
           s_scan_complete = false;
-          s_scan_json += "]";
-#ifdef USE_TEXT_SENSOR
-          if (this->scan_results_sensor_ != nullptr) {
-            this->scan_results_sensor_->publish_state(s_scan_json);
-          }
-#endif
-#ifdef USE_SENSOR
-          if (this->noise_floor_sensor_ != nullptr && s_scan_has_noise) {
-            this->noise_floor_sensor_->publish_state((float) s_scan_noise_dbm);
-          }
-#endif
-          s_scan_json.clear();
-          ESP_LOGI(TAG, "Scan results published (noise=%d dBm)", (int) s_scan_noise_dbm);
+          this->publish_scan_results_();
         }
       }
       break;
@@ -638,7 +629,6 @@ void HalowComponent::update_sensors_() {
         this->prev_rc_sent_[i] = rc->total_sent[i];
         this->prev_rc_success_[i] = rc->total_success[i];
       }
-      this->prev_rc_count_ = n;
 
       if (max_delta > 0) {
         uint32_t info = rc->rate_info[best_idx];
@@ -745,7 +735,16 @@ void HalowComponent::update_sensors_() {
 #endif
 }
 
+// esp_netif wrapper around mmipal's raw LWIP netif, created on first connect
+static struct esp_netif_obj *s_mdns_netif = nullptr;
+
 void HalowComponent::start_mdns_() {
+  if (s_mdns_netif != nullptr) {
+    // Already registered: re-announce so peers learn the (possibly new) address
+    mdns_netif_action((esp_netif_t *) s_mdns_netif, MDNS_EVENT_ANNOUNCE_IP4);
+    return;
+  }
+
   // Find mmipal's LWIP netif by matching HaLow MAC address
   uint8_t mac[6];
   if (mmwlan_get_mac_addr(mac) != MMWLAN_SUCCESS) {
@@ -779,10 +778,9 @@ void HalowComponent::start_mdns_() {
   fake->if_desc = strdup("halow");
   fake->route_prio = 50;
 
-  // Initialize mDNS. ESPHome's mdns component may have already tried and failed
-  // (because there was no esp_netif registered at that time). We free any failed
-  // state and reinitialize.
-  mdns_free();  // Clean up ESPHome's failed init attempt
+  // ESPHome's mdns component normally initialises the responder and registers its
+  // services (with the full TXT set: mac, friendly_name, api_encryption, ...)
+  // during setup. mdns_init() is a no-op in that case, so its records are kept.
   esp_err_t err = mdns_init();
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(err));
@@ -792,12 +790,11 @@ void HalowComponent::start_mdns_() {
     return;
   }
 
-  // Set hostname and instance name
   const char *hostname = App.get_name().c_str();
   mdns_hostname_set(hostname);
   mdns_instance_name_set(hostname);
 
-  // Register our fake netif with mDNS
+  // Register our wrapper netif with mDNS
   err = mdns_register_netif((esp_netif_t *) fake);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS register netif failed: %s", esp_err_to_name(err));
@@ -806,32 +803,37 @@ void HalowComponent::start_mdns_() {
     free(fake);
     return;
   }
+  s_mdns_netif = fake;
 
-  // Enable mDNS on this interface
   err = mdns_netif_action((esp_netif_t *) fake, MDNS_EVENT_ENABLE_IP4);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS enable IPv4 failed: %s", esp_err_to_name(err));
   }
-
-  // Announce the IP
   err = mdns_netif_action((esp_netif_t *) fake, MDNS_EVENT_ANNOUNCE_IP4);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS announce failed: %s", esp_err_to_name(err));
   }
 
-  // Re-register ESPHome services. The ESPHome MDNSComponent ran during setup()
-  // before we had a network interface, so its mdns_service_add() calls failed.
-  // We re-register the _esphomelib._tcp service here so Home Assistant can
-  // discover this device.
-  // Register _esphomelib._tcp service for Home Assistant discovery
-  {
+  // Fallback in case ESPHome's mdns component didn't register the API service
+  // (for example if its init failed). Home Assistant discovers ESPHome devices
+  // through this record.
+  if (!mdns_service_exists("_esphomelib", "_tcp", nullptr)) {
+    uint8_t base_mac[6];
+    char mac_str[13] = {0};
+    if (esp_efuse_mac_get_default(base_mac) == ESP_OK) {
+      snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x", base_mac[0], base_mac[1],
+               base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
+    }
+    std::string friendly_name = App.get_friendly_name().c_str();
     mdns_txt_item_t txt[] = {
         {(char *) "version", (char *) ESPHOME_VERSION},
+        {(char *) "mac", mac_str},
         {(char *) "platform", (char *) "ESP32"},
         {(char *) "board", (char *) ESPHOME_BOARD},
         {(char *) "network", (char *) "halow"},
+        {(char *) "friendly_name", (char *) friendly_name.c_str()},
     };
-    err = mdns_service_add(nullptr, "_esphomelib", "_tcp", 6053, txt, 4);
+    err = mdns_service_add(nullptr, "_esphomelib", "_tcp", 6053, txt, sizeof(txt) / sizeof(txt[0]));
     if (err == ESP_OK) {
       ESP_LOGI(TAG, "mDNS: registered _esphomelib._tcp service");
     } else {
@@ -839,8 +841,7 @@ void HalowComponent::start_mdns_() {
     }
   }
 
-  ESP_LOGI(TAG, "mDNS: registered '%s.local' on HaLow interface", hostname);
-  this->mdns_started_ = true;
+  ESP_LOGI(TAG, "mDNS: '%s.local' active on HaLow interface", hostname);
 }
 
 void HalowComponent::dump_config() {
@@ -848,6 +849,9 @@ void HalowComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  SSID: '%s'", this->ssid_.c_str());
   ESP_LOGCONFIG(TAG, "  Security: %s", this->security_type_.c_str());
   ESP_LOGCONFIG(TAG, "  Country: %s", this->country_code_.c_str());
+  if (this->max_tx_power_dbm_ > 0) {
+    ESP_LOGCONFIG(TAG, "  Max TX power: %u dBm", this->max_tx_power_dbm_);
+  }
   ESP_LOGCONFIG(TAG, "  SPI Pins: CLK=%d MOSI=%d MISO=%d CS=%d",
                 this->spi_clk_pin_, this->spi_mosi_pin_,
                 this->spi_miso_pin_, this->spi_cs_pin_);
@@ -878,39 +882,25 @@ std::string HalowComponent::get_ip_address_str() const {
 // --- Channel Scan ---
 
 static void halow_scan_rx_cb(const struct mmwlan_scan_result *result, void *arg) {
-  char bssid[18];
-  snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
-           result->bssid[0], result->bssid[1], result->bssid[2],
-           result->bssid[3], result->bssid[4], result->bssid[5]);
+  ScanEntry entry{};
+  size_t ssid_len = std::min<size_t>(result->ssid_len, MMWLAN_SSID_MAXLEN);
+  memcpy(entry.ssid, result->ssid, ssid_len);
+  memcpy(entry.bssid, result->bssid, 6);
+  entry.rssi = result->rssi;
+  entry.noise_dbm = result->noise_dbm;
+  entry.freq_hz = result->channel_freq_hz;
+  entry.bw_mhz = result->bw_mhz;
 
-  char ssid[33] = {0};
-  if (result->ssid_len > 0 && result->ssid_len <= 32) {
-    memcpy(ssid, result->ssid, result->ssid_len);
+  ESP_LOGD(TAG, "Scan: %s (%02X:%02X:%02X:%02X:%02X:%02X) RSSI=%d noise=%d freq=%luHz bw=%uMHz",
+           entry.ssid, entry.bssid[0], entry.bssid[1], entry.bssid[2], entry.bssid[3], entry.bssid[4],
+           entry.bssid[5], (int) entry.rssi, (int) entry.noise_dbm, (unsigned long) entry.freq_hz,
+           entry.bw_mhz);
+
+  if (s_scan_lock != nullptr && xSemaphoreTake(s_scan_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (s_scan_entries.size() < MAX_SCAN_ENTRIES)
+      s_scan_entries.push_back(entry);
+    xSemaphoreGive(s_scan_lock);
   }
-
-  // Build JSON entry
-  char entry[200];
-  snprintf(entry, sizeof(entry),
-           "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"noise\":%d,\"freq\":%lu,\"bw\":%u}",
-           ssid, bssid, (int) result->rssi, (int) result->noise_dbm,
-           (unsigned long) (result->channel_freq_hz / 1000), result->bw_mhz);
-
-  if (s_scan_json.length() > 1) {
-    s_scan_json += ",";
-  }
-  s_scan_json += entry;
-
-  // Track noise floor from our AP's channel (use the best noise reading)
-  if (!s_scan_has_noise || result->noise_dbm > s_scan_noise_dbm) {
-    // Higher noise = worse, but we want the reading from our channel.
-    // Just take the last reading — typically there's one AP on our channel.
-    s_scan_noise_dbm = result->noise_dbm;
-    s_scan_has_noise = true;
-  }
-
-  ESP_LOGD(TAG, "Scan: %s (%s) RSSI=%d noise=%d freq=%luHz bw=%uMHz",
-           ssid, bssid, (int) result->rssi, (int) result->noise_dbm,
-           (unsigned long) result->channel_freq_hz, result->bw_mhz);
 }
 
 static void halow_scan_complete_cb(enum mmwlan_scan_state state, void *arg) {
@@ -927,11 +917,14 @@ void HalowComponent::request_channel_scan() {
     ESP_LOGW(TAG, "Cannot scan — not connected");
     return;
   }
+  if (s_scan_lock == nullptr) {
+    return;
+  }
 
   ESP_LOGI(TAG, "Starting channel scan...");
-  s_scan_json = "[";
-  s_scan_noise_dbm = 0;
-  s_scan_has_noise = false;
+  xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+  s_scan_entries.clear();
+  xSemaphoreGive(s_scan_lock);
   s_scan_complete = false;
   s_scan_running = true;
 
@@ -944,8 +937,79 @@ void HalowComponent::request_channel_scan() {
   if (status != MMWLAN_SUCCESS) {
     ESP_LOGW(TAG, "Scan request failed: %d", (int) status);
     s_scan_running = false;
-    s_scan_json.clear();
   }
+}
+
+void HalowComponent::publish_scan_results_() {
+  std::vector<ScanEntry> entries;
+  xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+  entries.swap(s_scan_entries);
+  xSemaphoreGive(s_scan_lock);
+
+  // Strongest first, so the entries that fit in the state are the most relevant
+  std::sort(entries.begin(), entries.end(),
+            [](const ScanEntry &a, const ScanEntry &b) { return a.rssi > b.rssi; });
+
+  // Noise floor: prefer the reading from our own AP's channel, else the quietest channel
+  uint8_t our_bssid[6];
+  bool have_bssid = mmwlan_get_bssid(our_bssid) == MMWLAN_SUCCESS;
+  bool have_noise = false;
+  int8_t noise_dbm = 0;
+  for (const auto &e : entries) {
+    if (have_bssid && memcmp(e.bssid, our_bssid, 6) == 0) {
+      noise_dbm = e.noise_dbm;
+      have_noise = true;
+      break;
+    }
+    if (!have_noise || e.noise_dbm < noise_dbm) {
+      noise_dbm = e.noise_dbm;
+      have_noise = true;
+    }
+  }
+
+#ifdef USE_TEXT_SENSOR
+  if (this->scan_results_sensor_ != nullptr) {
+    // Compact JSON, truncated to whole entries that fit Home Assistant's 255-char limit
+    std::string json = "[";
+    for (const auto &e : entries) {
+      char ssid[MMWLAN_SSID_MAXLEN + 1];
+      size_t i = 0;
+      for (; e.ssid[i] != '\0' && i < MMWLAN_SSID_MAXLEN; i++) {
+        char c = e.ssid[i];
+        ssid[i] = (c == '"' || c == '\\' || (unsigned char) c < 0x20) ? '_' : c;
+      }
+      ssid[i] = '\0';
+      char item[128];
+      int n = snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d,\"noise\":%d,\"mhz\":%.1f,\"bw\":%u}",
+                       json.size() > 1 ? "," : "", ssid, (int) e.rssi, (int) e.noise_dbm,
+                       e.freq_hz / 1e6f, e.bw_mhz);
+      if (n <= 0 || json.size() + n + 1 > MAX_TEXT_SENSOR_LEN)
+        break;
+      json += item;
+    }
+    json += "]";
+    this->scan_results_sensor_->publish_state(json);
+  }
+#endif
+#ifdef USE_SENSOR
+  if (this->noise_floor_sensor_ != nullptr && have_noise) {
+    this->noise_floor_sensor_->publish_state((float) noise_dbm);
+  }
+#endif
+  ESP_LOGI(TAG, "Scan results published: %u networks (noise=%d dBm)", (unsigned) entries.size(),
+           (int) noise_dbm);
+}
+
+// --- ESPHome network integration ---
+
+bool network_is_connected() {
+  return global_halow_component != nullptr && global_halow_component->is_connected();
+}
+
+network::IPAddresses network_get_ip_addresses() {
+  if (global_halow_component == nullptr)
+    return {};
+  return global_halow_component->get_ip_addresses();
 }
 
 }  // namespace halow

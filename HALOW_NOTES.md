@@ -256,11 +256,15 @@ After the HaLow link comes up and an IP is acquired, we:
    IP/netmask/gateway directly from this LWIP netif pointer, so no other fields
    need to be populated.
 
-3. **Reinitialize mDNS**: call `mdns_free()` (cleans up ESPHome's earlier failed init
-   attempt) then `mdns_init()`. Set hostname via `mdns_hostname_set()`.
+3. **Reuse ESPHome's mDNS instance**: call `mdns_init()`, which is a no-op when ESPHome's
+   mdns component has already started the responder. (The original code called
+   `mdns_free()` first, which threw away ESPHome's services and their full TXT records —
+   `mac`, `friendly_name`, `api_encryption` — and re-added only a minimal `_esphomelib`.)
+   `_esphomelib._tcp` is only added if ESPHome didn't register it.
 
 4. **Register and enable**: call `mdns_register_netif()` with our fake `esp_netif_t*`,
    then `mdns_netif_action(MDNS_EVENT_ENABLE_IP4)` and `MDNS_EVENT_ANNOUNCE_IP4`.
+   After a reconnect the wrapper is reused and the address re-announced.
 
 ### Required sdkconfig for mDNS
 
@@ -273,13 +277,12 @@ CONFIG_MDNS_PREDEF_NETIF_AP=n
 CONFIG_MDNS_PREDEF_NETIF_ETH=n
 ```
 
-### Required build flag
+### Including the internal header
 
-The `esp_netif_lwip_internal.h` header is not on the default include path:
-
-```
--I~/.platformio/packages/framework-espidf/components/esp_netif/lwip
-```
+`esp_netif_lwip_internal.h` is not on the default include path. It is included as
+`"../lwip/esp_netif_lwip_internal.h"`, relative to esp_netif's public `include/`
+directory, which works with both the PlatformIO and native ESP-IDF toolchains. (The
+original `-I~/.platformio/...` flag only worked with PlatformIO.)
 
 ### Stability note
 
@@ -297,26 +300,26 @@ components/halow/
 ├── __init__.py              # CONFIG_SCHEMA, to_code(), build flags, auto-download SDK
 ├── halow_component.h     # Class declaration with sensor pointers
 ├── halow_component.cpp   # MM-IoT-SDK bridge with state machine + mDNS
-├── network_wrap.cpp         # Linker --wrap overrides for network::is_connected()
 └── pre_build.py             # PlatformIO script: firmware blob linking (3 strategies)
 ```
 
 ### State Machine
 ```
 setup() ok ──► CONNECTING ─── STA connected + valid IP ──► CONNECTED
-                   ▲  timeout 60s                              │
-                   │                                           │ mmipal LINK_DOWN
-               STOPPED ◄──────────────────────────────────────┘
-                   │  wait 5s                                  │
-                   └──► CONNECTING                   FreeRTOS timer (15s)
-                                                         │
-                                                    sta_disable()
-                                                    sta_enable()
-                                                         │
-                                                    mmipal LINK_UP
-                                                         │
-                                                    ──► CONNECTED
+                 │    ▲                                        │
+   60s since last│    │ link up + IP                           │ mmipal LINK_DOWN
+   attempt, no   │    │                                        ▼
+   timer pending ▼    │                                   CONNECTING
+        schedule_reconnect() ──► FreeRTOS timer (15s) ◄── (callback schedules)
+                                        │
+                                   sta_disable()
+                                   sta_enable()
 ```
+After the initial `sta_enable()` in `setup()`, only the timer task calls
+`mmwlan_sta_disable/enable`. `loop()` never touches the SDK connection state; on a
+connect timeout it just schedules the timer if it isn't already pending. The original
+code also retried from `loop()` (via a `STOPPED` state) and didn't reset the timeout
+on link loss, so the main loop and the timer could both drive the radio at once.
 
 ### Reconnection Architecture (FreeRTOS Timer)
 Modeled after the Xiao-Halow-to-WiFi-Bridge project. **Critical**: the `sta_disable()`
@@ -330,6 +333,11 @@ main loop. The 15-second delay lets the SDK clean up its internal state.
 5. `mmwlan_sta_enable()` — starts fresh WPA3-SAE association
 6. On success, `mmipal_link_status_callback()` fires `MMIPAL_LINK_UP`
 7. If `sta_enable` fails, timer restarts for another 15s attempt
+8. If the link still isn't up 60s after the last attempt, `loop()` schedules the timer again
+
+The timer task's stack is raised to 4096 bytes (`CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH`)
+because these SDK calls and their logging run on it. The reconnect uses the configured
+`security` type (it was hardcoded to SAE).
 
 **What doesn't work** (lessons learned):
 - Calling `sta_disable`/`sta_enable` from the main loop → SDK wedges
@@ -340,21 +348,34 @@ main loop. The 15-second delay lets the SDK clean up its internal state.
 Logs `=== LINK LOST ===` and `=== LINK RECOVERED === after Xs downtime`.
 
 ### Network Provider Integration
-ESPHome's `network::is_connected()` only checks USE_WIFI/USE_ETHERNET/etc.
-We use linker `--wrap` to intercept three mangled C++ symbols:
-- `_ZN7esphome7network12is_connectedEv` (is_connected)
-- `_ZN7esphome7network16get_ip_addressesEv` (get_ip_addresses)
-- `_ZN7esphome7network15get_use_addressEv` (get_use_address)
+ESPHome's `network::is_connected()` only checks its built-in interfaces
+(USE_WIFI/USE_ETHERNET/...). Without HaLow in that check, the API server disconnects
+every client with "Network down" and, with no client ever connected, reboots the
+device after `reboot_timeout` (15 min). MQTT, HTTP requests and others are gated the
+same way.
 
-Each wrapper checks `global_halow_component` first, then falls through to the
-original implementation. Without this, the API server disconnects all clients with
-"Network down" because it thinks there's no network.
+The original component intercepted the mangled symbols with linker `--wrap`. That
+stopped working in ESPHome 2026.x: `is_connected()` is now `ESPHOME_ALWAYS_INLINE` in
+`util.h` (no symbol to wrap) and `get_use_address()` was replaced by
+`get_use_address_to()`. The wraps silently did nothing.
+
+Now `_patch_network_util()` in `__init__.py` reads ESPHome's own `network/util.h` and
+`util.cpp`, inserts a `USE_HALOW` branch at the top of `is_connected()` and
+`get_ip_addresses()` that calls `halow::network_is_connected()` /
+`halow::network_get_ip_addresses()`, and registers the patched copies with
+`add_extra_build_file()` so they overwrite the originals in the build tree (ESP32
+`copy_files()` runs after the source tree is copied). It works on whatever ESPHome
+version is installed, and raises a build error if it can't find those functions.
+`get_use_address_to()` needs no hook: it already returns `<name>.local`.
 
 ### SDK Auto-Download
 The upstream Morse Micro MM-IoT-SDK is auto-downloaded from
 https://github.com/MorseMicro/mm-iot-esp32 to `~/.esphome/mm-iot-esp32/`
-on first compile. **No patches needed** — the upstream SDK natively supports
-ESP-IDF 5.5.2. Users can override with `mm_iot_sdk_path` in YAML.
+on first compile, **pinned to commit `96d9bf4`** (`MM_IOT_SDK_COMMIT` in `__init__.py`)
+via `git init` + `fetch --depth 1 <sha>`. The original cloned whatever HEAD was at the
+time, so a new Morse commit (or HAOS wiping `/root/.esphome`) could silently change
+the firmware. An existing checkout at a different commit triggers a warning.
+**No patches needed** to the SDK itself. Users can override with `mm_iot_sdk_path`.
 
 ### Sub-Band Configuration
 The upstream SDK v2.10.4 enables sub-band support by default, which allows the
@@ -645,7 +666,7 @@ Power save: disabled (required for reliable inbound connectivity)
 Heap: 304,520 bytes free (stable, no leaks)
 HA: Home Assistant 2026.4.2 connected via API
 SDK: auto-downloaded from sweitzja/mm-iot-esp32 fork
-Network: --wrap on is_connected() for API/OTA provider registration
+Network: build-time patch of ESPHome network/util.h + util.cpp (USE_HALOW branch)
 Reconnect: RSSI + STA state monitoring, auto-retry with 5s backoff
 ```
 

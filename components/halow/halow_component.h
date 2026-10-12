@@ -20,8 +20,8 @@ namespace esphome {
 namespace halow {
 
 enum class HalowState : uint8_t {
-  STOPPED,
-  CONNECTING,
+  STOPPED,     // setup() has not started the radio (or setup failed)
+  CONNECTING,  // association / DHCP in progress, or waiting for a reconnect
   CONNECTED,
 };
 
@@ -35,6 +35,7 @@ class HalowComponent : public Component {
   bool is_connected() const { return this->state_ == HalowState::CONNECTED; }
   const char *get_ssid() const { return this->ssid_.c_str(); }
   const char *get_password() const { return this->password_.c_str(); }
+  const std::string &get_security_type() const { return this->security_type_; }
   network::IPAddresses get_ip_addresses() const { return this->ip_addresses_; }
   std::string get_ip_address_str() const;
 
@@ -44,6 +45,7 @@ class HalowComponent : public Component {
   void set_country_code(const std::string &cc) { this->country_code_ = cc; }
   void set_security_type(const std::string &type) { this->security_type_ = type; }
   void set_sub_bands_enabled(bool enabled) { this->sub_bands_enabled_ = enabled; }
+  void set_max_tx_power(uint8_t dbm) { this->max_tx_power_dbm_ = dbm; }
 
   void set_manual_ip(const std::string &ip, const std::string &gw,
                      const std::string &subnet, const std::string &dns1,
@@ -85,11 +87,6 @@ class HalowComponent : public Component {
   void set_link_quality_sensor(text_sensor::TextSensor *s) { this->link_quality_sensor_ = s; }
   void set_scan_results_sensor(text_sensor::TextSensor *s) { this->scan_results_sensor_ = s; }
 #endif
-#ifdef USE_BUTTON
-  // Button stored for reference but not used — HalowScanButton calls request_channel_scan() directly
-  void set_scan_button(button::Button *b) { (void) b; }
-#endif
-
   // Called by the scan button
   void request_channel_scan();
 
@@ -98,7 +95,7 @@ class HalowComponent : public Component {
   bool check_ip_();
   void update_sensors_();
   void start_mdns_();
-  void full_radio_reset_();
+  void publish_scan_results_();
 
   // Config
   std::string ssid_;
@@ -106,6 +103,7 @@ class HalowComponent : public Component {
   std::string country_code_{"US"};
   std::string security_type_{"SAE"};
   bool sub_bands_enabled_{false};
+  uint8_t max_tx_power_dbm_{0};  // 0 = regulatory maximum
 
   // Static IP
   bool use_static_ip_{false};
@@ -127,15 +125,10 @@ class HalowComponent : public Component {
 
   // State
   HalowState state_{HalowState::STOPPED};
-  uint32_t connect_start_time_{0};
   uint32_t last_sensor_update_{0};
   uint32_t reconnect_count_{0};
   uint32_t disconnect_time_{0};
-  uint32_t last_rx_packets_{0};
-  uint32_t last_rx_check_time_{0};
-  uint8_t weak_rssi_count_{0};
   bool setup_complete_{false};
-  bool mdns_started_{false};
   network::IPAddresses ip_addresses_{};
 
   // Sensors
@@ -161,7 +154,6 @@ class HalowComponent : public Component {
   static const uint8_t MAX_RC_ENTRIES = 32;
   uint32_t prev_rc_sent_[MAX_RC_ENTRIES]{};
   uint32_t prev_rc_success_[MAX_RC_ENTRIES]{};
-  uint32_t prev_rc_count_{0};
 #endif
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *ip_address_sensor_{nullptr};
@@ -177,6 +169,12 @@ class HalowComponent : public Component {
 };
 
 extern HalowComponent *global_halow_component;  // NOLINT
+
+// Hooks spliced into ESPHome's network::is_connected() / get_ip_addresses() at
+// build time (see _patch_network_util() in __init__.py), so the API, MQTT, OTA
+// and friends treat HaLow as a network interface.
+bool network_is_connected();
+network::IPAddresses network_get_ip_addresses();
 
 #ifdef USE_BUTTON
 class HalowScanButton : public button::Button {

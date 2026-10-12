@@ -444,6 +444,7 @@ async def to_code(config):
     # Kconfig: ESP32-S3
     add_idf_sdkconfig_option("CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB", True)
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_NIST_KW_C", True)
+    add_idf_sdkconfig_option("CONFIG_MBEDTLS_CMAC_C", True)  # OMAC1 for WPA3/PMF; ESPHome disables it by default
 
     # Kconfig: LWIP settings for mmipal
     add_idf_sdkconfig_option("CONFIG_LWIP_NETIF_STATUS_CALLBACK", True)
@@ -477,6 +478,10 @@ async def to_code(config):
     # Wrap tcpip_input for RX byte counting — the SDK calls tcpip_input()
     # directly instead of going through netif->input
     cg.add_build_flag("-Wl,--wrap=tcpip_input")
+
+    # Wrap tcpip_init so mmipal_init() doesn't re-initialise the lwIP stack
+    # that ESPHome's network component already started
+    cg.add_build_flag("-Wl,--wrap=tcpip_init")
 
     # PlatformIO extra script for firmware blob generation
     cg.add_platformio_option(

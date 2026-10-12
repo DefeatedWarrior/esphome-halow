@@ -1,5 +1,7 @@
 # esphome-halow
 
+> **Fork note:** this fork of [sweitzja/esphome-halow](https://github.com/sweitzja/esphome-halow) adds four fixes so the component builds and runs on **ESPHome 2026.x** (native ESP-IDF toolchain, as used by the Home Assistant ESPHome Builder). See [PATCHES.md](PATCHES.md) for details.
+
 ESPHome external component for **Wi-Fi HaLow** (IEEE 802.11ah) using the [Morse Micro MM6108](https://www.morsemicro.com/chips/) SoC. Wi-Fi HaLow operates in sub-1 GHz spectrum (902-928 MHz in North America), offering up to 1 km range with low power consumption -- ideal for IoT devices that need to reach beyond standard Wi-Fi range.
 
 This component provides a drop-in network interface for ESPHome, replacing `wifi:` with `halow:`. It works like the built-in W5500/Ethernet SPI support: configure your pins, SSID, and password in YAML, and get full Home Assistant connectivity over HaLow.
@@ -53,7 +55,7 @@ esp32:
     version: recommended
 
 external_components:
-  - source: github://sweitzja/esphome-halow
+  - source: github://DefeatedWarrior/esphome-halow
     components: [halow]
 
 halow:

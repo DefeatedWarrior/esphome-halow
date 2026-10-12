@@ -39,7 +39,9 @@ extern "C" {
 // Internal header for esp_netif_obj struct layout — needed to create
 // a minimal wrapper around mmipal's raw LWIP netif for mDNS registration.
 // The struct layout has been stable since ESP-IDF v4.x.
-#include "esp_netif_lwip_internal.h"
+// Reached relative to esp_netif's public include dir so it resolves under both
+// the PlatformIO and native ESP-IDF toolchains.
+#include "../lwip/esp_netif_lwip_internal.h"
 }
 
 namespace esphome {
@@ -187,6 +189,24 @@ extern "C" {
   }
 }
 
+// ESPHome's network component calls esp_netif_init(), which starts the lwIP
+// tcpip thread. mmipal_init() then calls tcpip_init() again, and lwIP aborts
+// re-registering its socket VFS. Let the first call through; for later calls
+// just run the init-done callback on the already-running tcpip thread.
+extern "C" {
+  extern void __real_tcpip_init(tcpip_init_done_fn initfunc, void *arg);
+  void __wrap_tcpip_init(tcpip_init_done_fn initfunc, void *arg) {
+    static bool s_tcpip_started = false;
+    if (!s_tcpip_started) {
+      s_tcpip_started = true;
+      __real_tcpip_init(initfunc, arg);
+      return;
+    }
+    if (initfunc != nullptr)
+      tcpip_callback(initfunc, arg);
+  }
+}
+
 // --- Component Lifecycle ---
 
 float HalowComponent::get_setup_priority() const {
@@ -231,6 +251,14 @@ void HalowComponent::setup() {
   // shutdown handler didn't run, e.g., watchdog or power-loss reboot)
   periph_module_reset(PERIPH_SPI2_MODULE);
   spi_bus_free(SPI2_HOST);  // Ignore error — may not be initialized
+
+  // GPIO interrupt config survives a software reset. If the previous boot left the
+  // IRQ pin armed as LOW_LEVEL, installing the ISR service in mmhal_init() storms
+  // with no handler attached and trips the interrupt watchdog. Disarm both pins.
+  for (int pin : {this->spi_irq_pin_, this->busy_pin_}) {
+    gpio_intr_disable((gpio_num_t) pin);
+    gpio_set_intr_type((gpio_num_t) pin, GPIO_INTR_DISABLE);
+  }
 
   // Hardware-reset the MM6108 to ensure clean chip state.
   gpio_set_direction((gpio_num_t) this->reset_pin_, GPIO_MODE_OUTPUT);

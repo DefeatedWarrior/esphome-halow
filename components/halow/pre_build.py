@@ -1,10 +1,12 @@
 """PlatformIO extra script for halow component.
 
+Only used with ESPHome's (deprecated) PlatformIO toolchain; the default native
+ESP-IDF toolchain embeds the firmware blobs through the SDK's CMakeLists.
+
 Ensures firmware binary objects (.mbin.o) are available for linking.
 Tries multiple strategies: ninja custom targets, copying pre-built .o
 files from the SDK, or direct objcopy from .mbin source files.
 """
-import glob
 import os
 import shutil
 import subprocess
@@ -73,9 +75,9 @@ def _objcopy_mbin(mbin_path, obj_path, prefix):
         [
             objcopy, "-I", "binary", "-O", "elf32-xtensa-le", "-B", "xtensa",
             mbin_path, obj_path,
-            f"--redefine-sym", f"_binary_{c_ident}_start={prefix}_start",
-            f"--redefine-sym", f"_binary_{c_ident}_size={prefix}_size",
-            f"--redefine-sym", f"_binary_{c_ident}_end={prefix}_end",
+            "--redefine-sym", f"_binary_{c_ident}_start={prefix}_start",
+            "--redefine-sym", f"_binary_{c_ident}_size={prefix}_size",
+            "--redefine-sym", f"_binary_{c_ident}_end={prefix}_end",
             "--rename-section", ".data=.rodata._fw_mbin,contents,alloc,load,readonly,data",
         ],
         capture_output=True,

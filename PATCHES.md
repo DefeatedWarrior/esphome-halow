@@ -335,3 +335,16 @@ A second pass over the Part 2 code before merging it into `main`. Same verificat
 | 21 | Scan callback copied `ssid`/`bssid` without a null check; stale byte-counter comment. | Guarded; comment rewritten. |
 
 The README also gained a Troubleshooting entry for the 15-minute API `reboot_timeout` restart, which is what a device does when Home Assistant can't reach it.
+
+---
+
+# Part 4: repository cleanup
+
+No change to the component's behaviour.
+
+- **Layout:** the original bring-up apps moved to `tools/` (`spi_probe`, `sta_connect`, `iperf`) and the original engineering notes to `docs/HALOW_NOTES.md`, marked as a partly historical notebook.
+- **New reference docs:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how the component works), [docs/ESPHOME_COMPAT.md](docs/ESPHOME_COMPAT.md) (ESPHome internals relied on, upgrade checklist), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) (build/verify/flash workflow, test history), [docs/HARDWARE.md](docs/HARDWARE.md) (pins, power rails, failure signatures, the open power-reset investigation). `CLAUDE.md` is now a short index with the rules that matter.
+- **New tools:** `tools/serial_watch.py` (serial logger that survives resets) and `tools/test_network_patch.py` (runs the ESPHome network patch against several ESPHome releases; passes on 2025.6.0, 2025.12.0, 2026.4.0, 2026.9.1).
+- **README** reorganised around a Home Assistant quick start, with a status table and a documentation index; the sensor and configuration reference is unchanged.
+- **Small fixes:** `pre_build.py` lint (unused import, stray f-strings) and a note that it's PlatformIO-only; `spi_probe` no longer hardcodes the Linux port `/dev/ttyACM0`.
+- **Branches:** removed `improvements` and `esphome-2026-fixes`, which were identical to `main` and `pre-improvements`.

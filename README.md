@@ -1,225 +1,90 @@
 # esphome-halow
 
-> **Fork note:** this fork of [sweitzja/esphome-halow](https://github.com/sweitzja/esphome-halow) makes the component build and run on **ESPHome 2026.x** (native ESP-IDF toolchain, as used by the Home Assistant ESPHome Builder) and fixes several bugs found in review — including Home Assistant API connections being dropped on 2026.x, reconnect races, and an unpinned SDK download. See [PATCHES.md](PATCHES.md) for every change and why.
+ESPHome external component for **Wi-Fi HaLow** (IEEE 802.11ah) using the [Morse Micro MM6108](https://www.morsemicro.com/chips/). It replaces `wifi:` with `halow:`: configure the SSID, password and region in YAML, and the device joins a HaLow access point with full IP networking, so the Home Assistant API, OTA updates, mDNS and MQTT all work over sub-1 GHz radio with up to ~1 km range.
 
-ESPHome external component for **Wi-Fi HaLow** (IEEE 802.11ah) using the [Morse Micro MM6108](https://www.morsemicro.com/chips/) SoC. Wi-Fi HaLow operates in sub-1 GHz spectrum (902-928 MHz in North America, 915-928 MHz in Australia), offering up to 1 km range with low power consumption -- ideal for IoT devices that need to reach beyond standard Wi-Fi range.
-
-This component provides a drop-in network interface for ESPHome, replacing `wifi:` with `halow:`. It works like the built-in W5500/Ethernet SPI support: configure your pins, SSID, and password in YAML, and get full Home Assistant connectivity over HaLow.
+> **This is a fork** of [sweitzja/esphome-halow](https://github.com/sweitzja/esphome-halow). It makes the component build and run on **ESPHome 2026.x** (the native ESP-IDF toolchain used by the Home Assistant ESPHome Builder) and fixes bugs found in review, including Home Assistant connections being dropped on 2026.x. Every change is listed with its reasoning in [PATCHES.md](PATCHES.md). The state before the review fixes is kept on the [`pre-improvements`](https://github.com/DefeatedWarrior/esphome-halow/tree/pre-improvements) branch.
 
 ### Why HaLow over LoRa?
 
-HaLow uses standard IP networking — TCP, UDP, DHCP, mDNS, MQTT, and the ESPHome API all work natively. No protocol translation, no gateway bridges, no TTN accounts. Your HaLow device is just another IP device on your network that Home Assistant sees directly. OTA updates work over the same connection. Bidirectional control is instant (7ms latency). One AP supports 1000 devices with managed scheduling.
+HaLow uses standard IP networking: TCP, UDP, DHCP, mDNS, MQTT and the ESPHome API all work natively, with no protocol translation, gateway bridges or TTN accounts. A HaLow device is just another IP device on your network that Home Assistant sees directly, OTA updates work over the same link, and bidirectional control is fast (~7 ms). LoRa still wins on raw range (10-15 km vs ~1 km) and power for simple one-way sensors; for anything that needs reliable two-way communication, HaLow is much cleaner.
 
-LoRa still wins on raw range (10-15km vs ~1km) and power efficiency for simple one-way sensors, but for anything that needs reliable bidirectional communication, HaLow is dramatically cleaner.
+## Status
 
-## Supported Hardware
+| | Original component | This fork |
+|---|---|---|
+| ESPHome | before 2026.x (PlatformIO toolchain) | **2026.9.1** (native ESP-IDF 5.5.5) |
+| Builds, boots MM6108, joins WPA3-SAE AP, DHCP, mDNS | Tested | Tested |
+| Home Assistant API, OTA over HaLow, reconnect after range loss / AP restart, 20-min soak | Tested | Fixed for 2026.x and compile-verified; **not yet re-tested on hardware** |
 
-### HaLow Modules (MM6108-based)
-| Module | Form Factor | Notes |
-|--------|------------|-------|
-| [Seeed XIAO HaLow Hat](https://www.seeedstudio.com/Wio-WM6180-Wi-Fi-HaLow-Module-for-XIAO-p-6395.html) (WIO-WM6180) | XIAO hat | Plug-and-play with XIAO ESP32-S3 |
-| Quectel FGH100M-H | Module | Same MM6108 SoC, different form factor |
+Details: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#test-history).
 
-### Host MCUs
-| Board | Status | Notes |
-|-------|--------|-------|
-| Seeed XIAO ESP32-S3 | Tested | Default pin mapping matches HaLow Hat |
-| Other ESP32-S3 boards | Should work | Configure SPI pins in YAML |
-| ESP32-C3 / C6 / P4 | Untested | The MM-IoT-SDK ships libraries for these; set the pins for your board |
+## Hardware
 
-### Access Points
-| AP | Status | Notes |
-|----|--------|-------|
-| [GL-iNet HaLowLink 2](https://www.gl-inet.com/products/halowlink2/) | Tested | MM8108-based, WPA3-SAE, bridges to 2.4 GHz |
-| Morse Micro reference APs | Should work | Any 802.11ah AP |
+| Part | Status | Notes |
+|------|--------|-------|
+| [Seeed Wio-WM6180 HaLow module for XIAO](https://www.seeedstudio.com/Wio-WM6180-Wi-Fi-HaLow-Module-for-XIAO-p-6395.html) | Tested | MM6108 (MF16858 module); default pins match |
+| Seeed XIAO ESP32-S3 | Tested | Other ESP32-S3 boards should work with `*_pin` options |
+| ESP32-C3 / C6 / P4 | Untested | The MM-IoT-SDK ships libraries for these |
+| [GL-iNet HaLowLink 2](https://www.gl-inet.com/products/halowlink2/) access point | Tested | Needs bridging to your LAN, see [Access Point Setup](#access-point-setup-required) |
+| Other 802.11ah APs | Should work | WPA3-SAE, OWE or open |
 
-## Quick Start
+**Power:** the HaLow module's transmit amplifier runs from the **5 V** pin, which on a XIAO is the USB supply. It draws a surge when the radio powers up at "Connecting". Use a good USB cable and port or a powered hub; a weak 5 V supply shows up as the board resetting at that moment (see [Troubleshooting](#troubleshooting)).
 
-### Prerequisites
-- ESPHome with the ESP-IDF framework. This fork is tested with **ESPHome 2026.9.1** (ESP-IDF 5.5.5), including the Home Assistant ESPHome Builder add-on.
-- Git (for automatic SDK download on first compile)
-- A HaLow AP bridged to your LAN (see [Access Point Setup](#access-point-setup-required))
-- A solid 5 V supply: the radio draws a current spike when it powers up its RF section (see [Troubleshooting](#troubleshooting))
+Default pins (Seeed XIAO ESP32-S3 + Wio-WM6180):
 
-The [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) is downloaded automatically on first compile, pinned to the commit this component is tested against (`96d9bf4`). No manual setup needed. No patches required.
+| Function | GPIO | XIAO pin |
+|----------|------|----------|
+| SPI SCK / MISO / MOSI | 7 / 8 / 9 | D8 / D9 / D10 |
+| SPI CS | 4 | D3 |
+| SPI IRQ | 3 | D2 |
+| RESET_N | 1 | D0 |
+| WAKE | 2 | D1 |
+| BUSY | 5 | D4 |
 
-### Example YAML
+More in [docs/HARDWARE.md](docs/HARDWARE.md).
 
-```yaml
-esphome:
-  name: halow-sensor
-  friendly_name: HaLow Sensor
+## Quick start (Home Assistant ESPHome Builder)
 
-esp32:
-  board: seeed_xiao_esp32s3
-  framework:
-    type: esp-idf
-    version: recommended
+1. Set up your access point to bridge HaLow onto your LAN: [Access Point Setup](#access-point-setup-required).
+2. Add your HaLow network to the builder's **Secrets**:
+   ```yaml
+   halow_ssid: "your-halow-ssid"
+   halow_password: "your-halow-password"
+   ```
+3. Create a device with this YAML (adjust the name and `country_code`):
+   ```yaml
+   esphome:
+     name: halow-sensor
+     friendly_name: HaLow Sensor
 
-external_components:
-  - source: github://DefeatedWarrior/esphome-halow
-    components: [halow]
-    # refresh: 1min                    # pick up new commits without waiting a day
+   esp32:
+     board: seeed_xiao_esp32s3
+     framework:
+       type: esp-idf
 
-halow:
-  ssid: !secret halow_ssid
-  password: !secret halow_password
-  country_code: "US"                   # required: must match your region and AP (AU, CA, EU, GB, IN, JP, KR, NZ, US)
-  security: SAE                        # SAE (WPA3), OWE, or OPEN
-  # sub_bands: false                   # false=max throughput (8MHz), true=max range (1-2MHz)
-  # max_tx_power: 20                   # optional cap in dBm (default: regulatory maximum)
-  # manual_ip:                         # Optional static IP
-  #   static_ip: 192.168.12.100
-  #   gateway: 192.168.12.1
-  #   subnet: 255.255.255.0
-  # Pins default to XIAO HaLow Hat. Override for other boards:
-  # clk_pin: 7  / mosi_pin: 9 / miso_pin: 8 / cs_pin: 4
-  # irq_pin: 3 / reset_pin: 1 / wake_pin: 2 / busy_pin: 5
+   external_components:
+     - source: github://DefeatedWarrior/esphome-halow
+       components: [halow]
 
-  # Signal sensors
-  rssi:
-    name: "HaLow RSSI"
-  link_quality:
-    name: "HaLow Link Quality"
+   halow:                       # replaces wifi:
+     ssid: !secret halow_ssid
+     password: !secret halow_password
+     country_code: "US"         # required; must match your region and AP
+     rssi:
+       name: "HaLow RSSI"
+     link_quality:
+       name: "HaLow Link Quality"
+     ip_address:
+       name: "HaLow IP"
 
-  # Radio adaptation sensors
-  mcs:
-    name: "HaLow MCS"
-  bandwidth:
-    name: "HaLow Bandwidth"
-  tx_success_rate:
-    name: "HaLow TX Success Rate"
+   logger:
+   api:
+   ota:
+     - platform: esphome
+   ```
+4. Install over USB the first time. The first compile also downloads the Morse Micro SDK (about 50 MB), pinned to the tested version.
 
-  # Traffic sensors
-  tx_pps:
-    name: "HaLow TX Rate"
-  rx_pps:
-    name: "HaLow RX Rate"
-  tx_kbps:
-    name: "HaLow TX Throughput"
-  rx_kbps:
-    name: "HaLow RX Throughput"
-
-  # Diagnostic sensors
-  noise_floor:
-    name: "HaLow Noise Floor"
-  tx_frames_dropped:
-    name: "HaLow TX Dropped"
-  rx_frames_dropped:
-    name: "HaLow RX Dropped"
-  ccmp_failures:
-    name: "HaLow CCMP Failures"
-  hw_restarts:
-    name: "HaLow HW Restarts"
-
-  # Channel scan (button + results)
-  scan_channel:
-    name: "HaLow Channel Scan"
-  scan_results:
-    name: "HaLow Scan Results"
-
-  # Network info sensors
-  ip_address:
-    name: "HaLow IP"
-  gateway_address:
-    name: "HaLow Gateway"
-  subnet_mask:
-    name: "HaLow Subnet"
-  connected_ssid:
-    name: "HaLow SSID"
-  bssid:
-    name: "HaLow BSSID"
-  mac_address:
-    name: "HaLow MAC"
-  firmware_version:
-    name: "HaLow FW Version"
-
-api:
-
-logger:
-
-ota:
-  platform: esphome
-
-sensor:
-  - platform: uptime
-    name: Uptime
-```
-
-## How It Works
-
-### Architecture
-
-The MM6108 is a dedicated Wi-Fi HaLow SoC that communicates with the ESP32 host over SPI using an SDIO-over-SPI protocol. Unlike a simple peripheral, the MM6108 runs its own 802.11ah MAC/PHY stack and requires firmware loaded at every boot.
-
-```
-                    SPI (40 MHz)
-ESP32-S3 ◄────────────────────────► MM6108 (HaLow SoC)
-  │                                    │
-  ├─ ESPHome                           ├─ 802.11ah MAC/PHY
-  ├─ LWIP (via mmipal)                 ├─ WPA3-SAE
-  ├─ Home Assistant API                ├─ Sub-1 GHz radio
-  └─ OTA updates                       └─ Up to 1 km range
-```
-
-### Boot Sequence
-
-1. **mmhal_init()** -- Initialize SPI bus, GPIO pins (reset, wake, busy, IRQ)
-2. **mmwlan_init()** -- Initialize WLAN subsystem
-3. **mmwlan_boot()** -- Load `mm6108.mbin` firmware + `bcf_mf16858.mbin` board config over SPI
-4. **mmipal_init()** -- Initialize LWIP network stack with DHCP
-5. **mmwlan_sta_enable()** -- Start WPA3-SAE association with the AP
-6. Link comes up, DHCP assigns IP address. Full setup takes ~10s from cold boot.
-
-### Pin Mapping
-
-Default pin mapping for the Seeed XIAO HaLow Hat:
-
-| Function | GPIO | XIAO Pin | Direction |
-|----------|------|----------|-----------|
-| SPI SCK | 7 | D8 | Output |
-| SPI MISO | 8 | D9 | Input |
-| SPI MOSI | 9 | D10 | Output |
-| SPI CS | 4 | D3 | Output |
-| SPI IRQ | 3 | D2 | Input (data-ready interrupt) |
-| RESET_N | 1 | D0 | Output (active low) |
-| WAKE | 2 | D1 | Output |
-| BUSY | 5 | D4 | Input (rising edge) |
-
-Source: [Seeed mm-iot-esp32 Kconfig](https://github.com/Seeed-Studio/mm-iot-esp32/blob/main/framework/mm_shims/Kconfig)
-
-### Firmware Files
-
-The MM6108 has no persistent firmware. Two binary files are embedded in the ESP32 flash and loaded over SPI at every boot:
-
-| File | Purpose | Size | Source |
-|------|---------|------|--------|
-| `mm6108.mbin` | MM6108 SoC firmware (v1.17.6) | ~400 KB | MM-IoT-SDK `framework/morsefirmware/` |
-| `bcf_mf16858.mbin` | Board config for the MF16858 module (XIAO HaLow Hat / FGH100M-H); regulatory certified for US and CA, compliant for AU | ~2 KB | MM-IoT-SDK `framework/morsefirmware/mm6108/bcfs/` |
-
-**Important**: Firmware and BCF must be from the same SDK version.
-
-## Verified Test Results
-
-All testing performed with XIAO ESP32-S3 + XIAO HaLow Hat + GL-iNet HaLowLink 2 by the original author, on ESPHome before 2026.x (PlatformIO toolchain, IDF 5.5.2). On ESPHome 2026.9.1 this fork has been verified to compile, boot the MM6108, associate with WPA3-SAE, get a DHCP lease and register mDNS (AU region); see [PATCHES.md](PATCHES.md) for what has and hasn't been re-tested.
-
-| Test | Result |
-|------|--------|
-| SPI communication (SDIO registers) | Pass -- CCCR and FBR registers readable |
-| MM6108 firmware boot | Pass -- FW v1.17.6, morselib v2.10.4-esp32, chip ID 0x306 |
-| HaLow network scan | Pass -- Found AP at -41 dBm, 8 MHz BW |
-| WPA3-SAE authentication | Pass -- Link up in ~10 seconds |
-| DHCP IP acquisition | Pass -- 192.168.12.164 from gateway 192.168.12.1 |
-| LWIP TCP/UDP stack | Pass -- iperf server operational |
-| ESPHome compile (IDF 5.5.2) | Pass -- 1.08MB firmware, 59% flash usage |
-| **ESPHome full boot with sensors** | **Pass** -- RSSI (-35 dBm), IP, MAC, BSSID, FW version all reporting |
-| **mDNS discovery** | **Pass** -- `halow-test.local` registered on HaLow interface |
-| **LAN ping (power save off)** | **Pass** -- 10/10, 0% loss, 7-11ms latency |
-| **ESPHome API from LAN** | **Pass** -- TCP connect to port 6053 succeeded |
-| **20-min soak test** | **Pass** -- Heap stable (zero delta), 0 errors |
-| **Range walk reconnect** | **Pass** -- 16s recovery via FreeRTOS timer, no crash |
-| **AP power cycle reconnect** | **Pass** -- 53s recovery (AP boot time) |
-| **OTA over HaLow** | **Pass** -- 1.05MB in 10s, 3 consecutive OTA cycles clean |
+[example.yaml](example.yaml) has every option and sensor.
 
 ## Access Point Setup (Required)
 
@@ -244,28 +109,7 @@ or communicate with the device.
 on the HaLow interface by default. Without disabling it, HaLow devices can reach the internet
 but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discovery.
 
-## Troubleshooting
-
-**The board resets at "Connecting to '...'"** — the log stops right after `Connecting to '<ssid>' (SAE)...`, the USB serial port drops, and the next boot reports a power-on reset (`debug:` component: *Reset Reason: Power On*). `mmwlan_sta_enable()` powers up the MM6108's RF section at that moment; if the 3.3 V rail collapses the ESP32 cold-boots. This is a power or hardware problem, not firmware: lowering `max_tx_power` doesn't help because it happens before any transmission. Check the hat is fully seated with no bent pins, the antenna is firmly attached, and try a different USB cable, port or a powered hub.
-
-**It connects but Home Assistant can't reach it** — the AP is probably routing/NATing the HaLow network instead of bridging it. Follow [Access Point Setup](#access-point-setup-required), including disabling masquerade. You can check from another machine on your LAN with `ping <device-ip>`.
-
-**"Connect timeout" with no `STA state: CONNECTING`** — the device never found the AP. Check `country_code` matches the AP's region: the channel plans don't overlap in the way you might expect (for example, a `US` device won't find an `AU` AP).
-
-**The device reboots every 15 minutes** — that's ESPHome's API `reboot_timeout`: with no Home Assistant client connected for 15 minutes it restarts. It means HA can't reach the device (see the previous item). While you sort out the network, set `api: reboot_timeout: 0s` to stop it.
-
-**Changes to this repo don't show up in the Home Assistant ESPHome Builder** — external components are cached for a day. Add `refresh: 1min` (or `always`) under the `external_components` source.
-
-**"halow: could not find is_connected() in ESPHome's network component"** — your ESPHome version restructured the network component and this component needs updating; it refuses to build rather than produce firmware that silently drops API connections.
-
-## Known Limitations
-
-- **Power save disabled** — The MM6108 BUSY pin has a firmware bug (confirmed by Morse Micro). Power save is disabled to ensure reliable bidirectional communication. The radio therefore draws full receive current all the time. Monitor [firmware releases](https://github.com/MorseMicro/firmware_binaries/releases/) for a fix.
-- **TWT not yet implemented** — Requires working BUSY pin for battery operation. A GPIO-based workaround exists but is not integrated.
-- **Station mode, MM6108 only** — AP mode and the MM8108 are not implemented; the config rejects them.
-- **Tested on ESP32-S3 only** — the SDK also supports ESP32-C3, C6 and P4, but this component hasn't been run on them.
-
-## Component Configuration
+## Configuration
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -550,27 +394,73 @@ firmware_version:
   name: "HaLow FW Version"
 ```
 
+## Troubleshooting
+
+**The board resets at "Connecting to '...'"** — the log stops right after `Connecting to '<ssid>' (SAE)...`, the USB serial port drops, and the next boot reports a power-on reset (`debug:` component: *Reset Reason: Power On*). `mmwlan_sta_enable()` powers up the MM6108's RF section at that moment; if the 3.3 V rail collapses the ESP32 cold-boots. This is a power or hardware problem, not firmware: lowering `max_tx_power` doesn't help because it happens before any transmission. Check the hat is fully seated with no bent pins, the antenna is firmly attached, and try a different USB cable, port or a powered hub.
+
+**It connects but Home Assistant can't reach it** — the AP is probably routing/NATing the HaLow network instead of bridging it. Follow [Access Point Setup](#access-point-setup-required), including disabling masquerade. You can check from another machine on your LAN with `ping <device-ip>`.
+
+**"Connect timeout" with no `STA state: CONNECTING`** — the device never found the AP. Check `country_code` matches the AP's region: the channel plans don't overlap in the way you might expect (for example, a `US` device won't find an `AU` AP).
+
+**The device reboots every 15 minutes** — that's ESPHome's API `reboot_timeout`: with no Home Assistant client connected for 15 minutes it restarts. It means HA can't reach the device (see the previous item). While you sort out the network, set `api: reboot_timeout: 0s` to stop it.
+
+**Changes to this repo don't show up in the Home Assistant ESPHome Builder** — external components are cached for a day. Add `refresh: 1min` (or `always`) under the `external_components` source.
+
+**"halow: could not find is_connected() in ESPHome's network component"** — your ESPHome version restructured the network component and this component needs updating; it refuses to build rather than produce firmware that silently drops API connections.
+
+## Known Limitations
+
+- **Power save disabled** — The MM6108 BUSY pin has a firmware bug (confirmed by Morse Micro). Power save is disabled to ensure reliable bidirectional communication. The radio therefore draws full receive current all the time. Monitor [firmware releases](https://github.com/MorseMicro/firmware_binaries/releases/) for a fix.
+- **TWT not yet implemented** — Requires working BUSY pin for battery operation. A GPIO-based workaround exists but is not integrated.
+- **Station mode, MM6108 only** — AP mode and the MM8108 are not implemented; the config rejects them.
+- **Tested on ESP32-S3 only** — the SDK also supports ESP32-C3, C6 and P4, but this component hasn't been run on them.
+
+## How it works
+
+```
+                    SPI (40 MHz)
+ESP32-S3 ◄────────────────────────► MM6108 (HaLow SoC)
+  ├─ ESPHome                          ├─ 802.11ah MAC/PHY
+  ├─ lwIP (via Morse mmipal)          ├─ WPA3-SAE
+  ├─ Home Assistant API               ├─ Sub-1 GHz radio
+  └─ OTA updates                      └─ Firmware loaded over SPI at every boot
+```
+
+At boot the component resets the MM6108, loads its firmware and board configuration (BCF) over SPI, brings up an lwIP interface, and connects as a station. A FreeRTOS timer handles reconnection. At build time it splices HaLow into ESPHome's network status checks so the API, MQTT and OTA treat it as a network interface. Full details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Documentation
+
+| Document | For |
+|----------|-----|
+| [PATCHES.md](PATCHES.md) | Every change this fork makes, why, and how it was verified |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the component works: build steps, tasks, state machine, reconnects, mDNS, sensors |
+| [docs/HARDWARE.md](docs/HARDWARE.md) | Pins, power rails, firmware/BCF, failure signatures, reset reasons |
+| [docs/ESPHOME_COMPAT.md](docs/ESPHOME_COMPAT.md) | ESPHome internals the component depends on, and what to check when ESPHome updates |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, verifying, flashing, logs, branches, test history |
+| [docs/HALOW_NOTES.md](docs/HALOW_NOTES.md) | The original author's engineering notebook (partly historical) |
+
 ## Dependencies
 
-This component depends on the [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) (auto-downloaded on first compile) which provides:
+The [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) is downloaded on first compile, pinned to commit `96d9bf4` (morselib 2.10.4, MM6108 firmware 1.17.6). It provides:
 
-- **morselib** -- Prebuilt binary library containing the WLAN driver and crypto
-- **mm_shims** -- ESP-IDF HAL layer (SPI, GPIO, FreeRTOS integration)
-- **mmipal** -- IP abstraction layer (LWIP netif binding)
-- **mmutils** -- Utility functions (OS abstraction, config store)
-- **morsefirmware/** -- MM6108 firmware and board config binaries
-
-The SDK is licensed under Apache-2.0 (shims/examples) and a Morse Micro BDL (binary libraries).
+- **morselib**: prebuilt WLAN driver and supplicant
+- **mm_shims**: ESP-IDF hardware layer (SPI, GPIO, FreeRTOS)
+- **mmipal**: lwIP network interface
+- **mmutils**, **mmpktmem**, **mmregdb**: utilities, packet memory, regulatory database
+- **morsefirmware**: MM6108 firmware and board configuration files
 
 ## References
 
-- [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32) -- **Auto-downloaded by this component**, pinned to commit `96d9bf4` (morselib 2.10.4)
-- [Seeed MM-IoT-SDK](https://github.com/Seeed-Studio/mm-iot-esp32) -- Seeed fork (v2.6.4, legacy)
-- [Morse Micro morse-firmware](https://github.com/MorseMicro/morse-firmware) -- Additional BCF files for Quectel modules
-- [Morse Micro MM6108 Datasheet](https://www.morsemicro.com/chips/) -- SoC specifications
-- [Seeed Wiki: Getting Started with Wi-Fi HaLow](https://wiki.seeedstudio.com/getting_started_with_wifi_halow_module_for_xiao/) -- Hardware setup guide
-- [IEEE 802.11ah Standard](https://en.wikipedia.org/wiki/IEEE_802.11ah) -- Wi-Fi HaLow specification
-- [Xiao-Halow-to-WiFi-Bridge](https://github.com/gtgreenw/Xiao-Halow-to-WiFi-Bridge) -- Related community project
+- [Morse Micro MM-IoT-SDK](https://github.com/MorseMicro/mm-iot-esp32)
+- [Seeed MM-IoT-SDK fork](https://github.com/Seeed-Studio/mm-iot-esp32) (older, used by Seeed's examples)
+- [Morse Micro morse-firmware](https://github.com/MorseMicro/morse-firmware): additional BCF files
+- [Seeed Wiki: Getting Started with Wi-Fi HaLow for XIAO](https://wiki.seeedstudio.com/getting_started_with_wifi_halow_module_for_xiao/)
+- [IEEE 802.11ah](https://en.wikipedia.org/wiki/IEEE_802.11ah)
+- [Xiao-Halow-to-WiFi-Bridge](https://github.com/gtgreenw/Xiao-Halow-to-WiFi-Bridge): the reconnect approach is modelled on this project
+
+## Credits
+
+Original component by [sweitzja](https://github.com/sweitzja/esphome-halow). ESPHome 2026.x support and review fixes in this fork.
 
 ## License
 

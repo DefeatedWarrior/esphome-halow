@@ -1,5 +1,7 @@
 # Engineering Notes - ESPHome Wi-Fi HaLow Component
 
+> **Historical notebook.** These are the original author's bring-up notes, lightly updated by the fork. They're the best record of *why* the SDK is driven the way it is (what was tried and failed), but some details are out of date, especially about the Seeed SDK fork and the PlatformIO toolchain. For how the component works today see [ARCHITECTURE.md](ARCHITECTURE.md); for ESPHome version issues see [ESPHOME_COMPAT.md](ESPHOME_COMPAT.md); for the hardware see [HARDWARE.md](HARDWARE.md).
+
 ## Overview
 
 IEEE 802.11ah (Wi-Fi HaLow) operates in sub-1 GHz spectrum (902-928 MHz in North America)
@@ -300,7 +302,7 @@ components/halow/
 ├── __init__.py              # CONFIG_SCHEMA, to_code(), build flags, auto-download SDK
 ├── halow_component.h     # Class declaration with sensor pointers
 ├── halow_component.cpp   # MM-IoT-SDK bridge with state machine + mDNS
-└── pre_build.py             # PlatformIO script: firmware blob linking (3 strategies)
+└── pre_build.py             # PlatformIO toolchain only: firmware blob linking (3 strategies)
 ```
 
 ### State Machine
@@ -388,12 +390,12 @@ can enable them with `sub_bands: true`.
 - `add_idf_component(path=...)` for morselib, mm_shims, mmipal, mmutils, mmpktmem,
   mmregdb
 - `add_idf_sdkconfig_option()` for Kconfig (pins, FreeRTOS, BCF, chip type, LWIP)
-- `pre_build.py` handles firmware blob linking with 3 fallback strategies:
+- `pre_build.py` (PlatformIO toolchain only; the native ESP-IDF toolchain embeds the blobs through the SDK's CMakeLists) handles firmware blob linking with 3 fallback strategies:
   1. **ninja**: runs CMake custom targets (objcopy .mbin -> .o)
   2. **copy**: copies pre-built .o files from SDK mm_shims/ directory
   3. **objcopy**: generates .o directly from .mbin source files
 - Auto-detects BCF name from Kconfig choice (Seeed) or string (upstream)
-- Uses pre-patched Seeed MM-IoT-SDK v2.6.4 fork (IDF 5.5.2 compatible)
+- Historically used a pre-patched Seeed MM-IoT-SDK v2.6.4 fork; now uses the upstream SDK, pinned (see ARCHITECTURE.md)
 
 ### Sensors
 All sensors are optional YAML config entries within the `halow:` block:

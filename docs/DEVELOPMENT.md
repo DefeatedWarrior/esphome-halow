@@ -122,4 +122,5 @@ This fork, ESPHome 2026.9.1 (native ESP-IDF 5.5.5), XIAO ESP32-S3 + Wio-WM6180 +
 |------|--------|
 | Fixes #1-#4: compile, boot, WPA3-SAE, DHCP, mDNS | Pass (2026-10-12), before the hardware began resetting |
 | Fixes #5-#21: compile, validation, network patch on 4 ESPHome releases, SDK download | Pass |
-| Fixes #5-#21 at runtime (HA connection, reconnects, scan, mDNS re-announce) | **Not yet tested**: the board power-resets at RF power-up ([HARDWARE.md](HARDWARE.md#investigation-log-power-on-reset-at-connecting-2026-10-1213)) |
+| `main` on hardware (2026-10-13, after a 5 V capacitor fix): boot, connect, DHCP, mDNS via ESPHome's own records, connect-timeout → timer reconnect cycle (5 cycles, no crash or overlap) | Pass |
+| Home Assistant API over HaLow (fix #5 at runtime), scan, OTA over HaLow, recovery after link loss, static IP DNS, long soak | **Not yet tested** (HA's network can't reach the HaLow network yet) |

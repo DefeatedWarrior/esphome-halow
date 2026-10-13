@@ -35,6 +35,7 @@ def main():
     patterns = [args.port] if args.port else ["/dev/cu.usbmodem*", "/dev/ttyACM*"]
     end = time.time() + args.seconds
     drops = 0
+    busy_reported = False
 
     with open(args.logfile, "w", encoding="utf-8") as out:
 
@@ -48,7 +49,19 @@ def main():
                 time.sleep(0.05)
                 continue
             try:
-                with serial.Serial(ports[0], args.baud, timeout=0.2) as ser:
+                ser = serial.Serial(ports[0], args.baud, timeout=0.2)
+            except (OSError, serial.SerialException) as err:
+                # Another program (e.g. a browser's web serial page) holds the port:
+                # say so once, then keep retrying quietly
+                if not busy_reported:
+                    mark(f"cannot open {ports[0]}: {err}")
+                    print(f"{ports[0]} is busy; close whatever has it open", file=sys.stderr)
+                    busy_reported = True
+                time.sleep(1)
+                continue
+            busy_reported = False
+            try:
+                with ser:
                     mark(f"opened {ports[0]}")
                     while time.time() < end:
                         data = ser.read(4096)

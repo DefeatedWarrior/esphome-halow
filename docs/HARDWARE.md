@@ -76,4 +76,6 @@ Board: XIAO ESP32-S3 + Wio-WM6180, HaLowLink 2 AP, AU region.
 - Morse SDK's internal assert path calls `esp_restart()`, which would give reason 3 and keep the USB port, so ruled out.
 - Seeed's HAL compared with upstream: identical. Seeed's wiki then showed the 5 V PA rail comes straight from USB, which explains a power-on reset at RF power-up regardless of TX power.
 
-**Conclusion so far:** a power/hardware problem on the 5 V path (cable, USB port or hub, the hat's 5 V/GND pin contact). The same cable was used throughout. **Next tests:** a different short USB cable, a powered hub or USB charger (check the HaLowLink 2 client list), reseating the hat, and measuring the XIAO's 5 V pin during connect. Update this log with the outcome.
+**Conclusion:** a power problem on the 5 V path feeding the module's TX amplifier.
+
+- 2026-10-13 17:24: **an electrolytic capacitor added across the 5 V rail stopped the power-on resets.** The board now stays up after `Connecting` (20+ s observed); the only resets in the log were USB-requested (`rst:0x15`, "Reset Reason: USB peripheral") from the web serial page. Still open: no `STA state: CONNECTING` appeared within 20 s, so association isn't confirmed yet. Needs an uninterrupted log of at least 2 minutes (the first connect timeout is at 60 s). If it never finds the AP, check the AP, and that the module's 5 V actually reaches it (without 5 V it receives but can't transmit).

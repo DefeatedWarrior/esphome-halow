@@ -396,7 +396,7 @@ firmware_version:
 
 ## Troubleshooting
 
-**The board resets at "Connecting to '...'"** — the log stops right after `Connecting to '<ssid>' (SAE)...`, the USB serial port drops, and the next boot reports a power-on reset (`debug:` component: *Reset Reason: Power On*). `mmwlan_sta_enable()` powers up the MM6108's RF section at that moment; if the 3.3 V rail collapses the ESP32 cold-boots. This is a power or hardware problem, not firmware: lowering `max_tx_power` doesn't help because it happens before any transmission. Check the hat is fully seated with no bent pins, the antenna is firmly attached, and try a different USB cable, port or a powered hub.
+**The board resets at "Connecting to '...'"** — the log stops right after `Connecting to '<ssid>' (SAE)...`, the USB serial port drops, and the next boot reports a power-on reset (`debug:` component: *Reset Reason: Power On*). `mmwlan_sta_enable()` powers up the MM6108's RF section at that moment; if the 3.3 V rail collapses the ESP32 cold-boots. This is a power or hardware problem, not firmware: lowering `max_tx_power` doesn't help because it happens before any transmission. Check the hat is fully seated with no bent pins, the antenna is firmly attached, and try a different USB cable, port or a powered hub. In testing, an electrolytic capacitor across the 5 V rail and GND stopped the resets (mind the polarity: stripe to GND).
 
 **It connects but Home Assistant can't reach it** — the AP is probably routing/NATing the HaLow network instead of bridging it. Follow [Access Point Setup](#access-point-setup-required), including disabling masquerade. You can check from another machine on your LAN with `ping <device-ip>`.
 

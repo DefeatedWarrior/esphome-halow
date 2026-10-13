@@ -70,6 +70,7 @@ More in [docs/HARDWARE.md](docs/HARDWARE.md).
      ssid: !secret halow_ssid
      password: !secret halow_password
      country_code: "US"         # required; must match your region and AP
+     # use_address: 192.168.1.86  # device IP, if your HaLow network is a separate subnet
      rssi:
        name: "HaLow RSSI"
      link_quality:
@@ -82,7 +83,8 @@ More in [docs/HARDWARE.md](docs/HARDWARE.md).
    ota:
      - platform: esphome
    ```
-4. Install over USB the first time. The first compile also downloads the Morse Micro SDK (about 50 MB), pinned to the tested version.
+4. If your HaLow network is a **separate subnet** from Home Assistant (the AP routes rather than bridges), uncomment `use_address` and set it to the device's IP, ideally reserved on the AP. The Device Builder finds devices by mDNS name, which doesn't cross subnets; without it, wireless logs and OTA report "could not be resolved". Home Assistant also needs a route to that subnet.
+5. Install over USB the first time. The first compile also downloads the Morse Micro SDK (about 50 MB), pinned to the tested version.
 
 [example.yaml](example.yaml) has every option and sensor.
 

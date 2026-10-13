@@ -61,9 +61,10 @@ Run before pushing to `main`:
    NM=$(ls ~/Library/Caches/esphome/idf/tools/xtensa-esp-elf/*/xtensa-esp-elf/bin/xtensa-esp32s3-elf-nm)
    $NM -C $(find .esphome/build/<name>/build -name api_server.cpp.obj) | grep halow   # expect U esphome::halow::network_is_connected()
    ```
-5. **Config validation:** each of these must fail with a clear message: `country_code: XX`, no `country_code`, `type: MM8108`, `mode: AP`, a 33-character `ssid`, two pins on the same GPIO, `max_tx_power: 40`, `security: SAE` without a password. `country_code: au` must pass (normalised to `AU`).
-6. **Clean build from GitHub**, as Home Assistant does, after pushing a branch: `source: github://DefeatedWarrior/esphome-halow@<branch>` in a fresh folder.
-7. **Hardware** (when possible): flash, watch the log (below) for `HaLow connected to`, `Status: ON`, and Home Assistant staying connected past 15 minutes.
+5. **Config validation:** each of these must fail with a clear message: `country_code: XX`, no `country_code`, `type: MM8108`, `mode: AP`, a 33-character `ssid`, two pins on the same GPIO, `max_tx_power: 40`, `security: SAE` without a password. `country_code: au` must pass (normalised to `AU`). `esphome config` must show `use_address` defaulting to `<name>.local` (or the `manual_ip` address).
+6. **Device address:** with `use_address: <ip>` set, `esphome logs test.yaml --device OTA` must print `Starting log output from <ip>`, not "could not be resolved" (stop it with Ctrl-C).
+7. **Clean build from GitHub**, as Home Assistant does, after pushing a branch: `source: github://DefeatedWarrior/esphome-halow@<branch>` in a fresh folder.
+8. **Hardware** (when possible): flash, watch the log (below) for `HaLow connected to`, `Status: ON`, and Home Assistant staying connected past 15 minutes.
 
 ## Flashing and logs
 

@@ -348,3 +348,13 @@ No change to the component's behaviour.
 - **README** reorganised around a Home Assistant quick start, with a status table and a documentation index; the sensor and configuration reference is unchanged.
 - **Small fixes:** `pre_build.py` lint (unused import, stray f-strings) and a note that it's PlatformIO-only; `spi_probe` no longer hardcodes the Linux port `/dev/ttyACM0`.
 - **Branches:** removed `improvements` and `esphome-2026-fixes`, which were identical to `main` and `pre-improvements`.
+
+---
+
+# Part 5: Device Builder can't find the device
+
+**Problem.** Opening logs or installing wirelessly from the Device Builder failed with `All specified devices ['OTA'] could not be resolved. Is the device connected to the network?`. ESPHome picks the host from `CORE.address`, which only reads `use_address` from `wifi:`, `ethernet:` and `openthread:`. For a `halow:` device it was always empty, so wireless logs and OTA from the builder could never work, and mDNS can't help anyway when the HaLow network is a separate subnet.
+
+**Fix.** New `use_address` option under `halow:`, defaulting like wifi's (static IP if set, else `<name>.local`). The component wraps the `CORE.address` property so it falls back to `halow.use_address`; if ESPHome ever changes that property the hook just does nothing.
+
+**Verified:** with the previous code, `esphome logs <config> --device OTA` reproduces the exact error. With this change and `use_address: 10.1.30.195`, it prints `Starting log output from 10.1.30.195 using esphome API`. The firmware is byte-for-byte the same size (the change is host-side only). Not verified: an actual log session from Home Assistant, which also needs HA to have a route to the HaLow network.

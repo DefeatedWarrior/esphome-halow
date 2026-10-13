@@ -122,6 +122,7 @@ but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discov
 | `bcf_file` | string | `bcf_mf16858.mbin` | Board configuration file; checked against the SDK at compile time |
 | `sub_bands` | bool | `false` | `false` = 8 MHz max throughput, `true` = 1-2 MHz max range |
 | `max_tx_power` | int | *(regulatory max)* | Cap TX power, 1-30 dBm. Can only lower power, never exceed the regulatory limit |
+| `use_address` | string | static IP, else `<name>.local` | Address the Device Builder / CLI uses for wireless logs and OTA. Set it to the device's IP when mDNS can't reach it, e.g. when the HaLow network is a separate subnet |
 | `manual_ip` | schema | *(DHCP)* | Static IP config (static_ip, gateway, subnet, dns1, dns2). Set `dns1` if the device needs name resolution (e.g. SNTP, HTTP) |
 | `mm_iot_sdk_path` | string | `~/.esphome/mm-iot-esp32` | Where the MM-IoT-SDK is downloaded / found |
 | `clk_pin` | int | `7` | SPI clock GPIO |
@@ -401,6 +402,8 @@ firmware_version:
 **It connects but Home Assistant can't reach it** — the AP is probably routing/NATing the HaLow network instead of bridging it. Follow [Access Point Setup](#access-point-setup-required), including disabling masquerade. You can check from another machine on your LAN with `ping <device-ip>`.
 
 **"Connect timeout" with no `STA state: CONNECTING`** — the device never found the AP. Check `country_code` matches the AP's region: the channel plans don't overlap in the way you might expect (for example, a `US` device won't find an `AU` AP).
+
+**Device Builder: "All specified devices ['OTA'] could not be resolved"** when opening logs or installing wirelessly. The builder finds devices by mDNS (`<name>.local`), which doesn't cross subnets. Set `use_address: <device IP>` under `halow:`, and give the device a fixed address (a DHCP reservation on the AP, or `manual_ip`). The machine running Home Assistant must also be able to route to that IP.
 
 **The device reboots every 15 minutes** — that's ESPHome's API `reboot_timeout`: with no Home Assistant client connected for 15 minutes it restarts. It means HA can't reach the device (see the previous item). While you sort out the network, set `api: reboot_timeout: 0s` to stop it.
 

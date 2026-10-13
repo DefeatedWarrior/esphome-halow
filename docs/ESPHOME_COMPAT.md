@@ -50,7 +50,15 @@ Relies on `mdns_init()` returning `ESP_OK` without re-initialising when the resp
 
 `App.get_name()`, `App.get_friendly_name()` (returns `StringRef` in 2026.x; only `.c_str()` is used), `network::IPAddress`/`IPAddresses`, `setup_priority::WIFI`, `ESPHOME_VERSION`, `ESPHOME_BOARD`. `get_mac_address()` moved to `alloc_helpers.h` in 2026.x and is due to change again, so the MAC TXT record uses `esp_efuse_mac_get_default()` instead.
 
-### 8. PlatformIO toolchain
+### 8. Device address for logs and OTA (`CORE.address`)
+
+**What:** the CLI and Device Builder pick the host for wireless logs and OTA from `CORE.address`, a property that only reads `use_address` from the `wifi`, `ethernet` and `openthread` sections. For a halow-only device it was `None`, so wireless logs/OTA from the builder failed with "could not be resolved", even on the same network.
+
+**Now:** `halow:` has a `use_address` option (defaulting like wifi's: the static IP, else `<name>.local`), and `_install_address_hook()` wraps the `CORE.address` property at module import so it falls back to `halow.use_address`. If `address` stops being a property, the hook does nothing (logged at debug level).
+
+**Check:** with `use_address: <ip>`, `esphome logs test.yaml --device OTA` must print `Starting log output from <ip>`, not "could not be resolved".
+
+### 9. PlatformIO toolchain
 
 Deprecated for ESP32, and due to be removed in ESPHome 2027.2.0. `pre_build.py` only matters there. Once it's gone, delete `pre_build.py` and its registration.
 

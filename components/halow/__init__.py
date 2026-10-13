@@ -13,6 +13,7 @@ from esphome.const import (
     CONF_ID,
     CONF_PASSWORD,
     CONF_SSID,
+    CONF_USE_ADDRESS,
     DEVICE_CLASS_SIGNAL_STRENGTH,
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
@@ -143,7 +144,47 @@ def _validate_config(config):
         if pin in seen:
             raise cv.Invalid(f"GPIO{pin} is used for both {seen[pin]} and {key}", [key])
         seen[pin] = key
+
+    # Address the ESPHome CLI / Device Builder uses for wireless logs and OTA,
+    # defaulted the same way the wifi component does
+    if CONF_USE_ADDRESS not in config:
+        config = config.copy()
+        if CONF_MANUAL_IP in config:
+            config[CONF_USE_ADDRESS] = str(config[CONF_MANUAL_IP][CONF_STATIC_IP])
+        else:
+            config[CONF_USE_ADDRESS] = f"{CORE.name}.local"
     return config
+
+
+def _install_address_hook():
+    """Let ESPHome's CLI and Device Builder find halow devices.
+
+    CORE.address (used to pick the host for wireless logs and OTA uploads) only
+    looks at the wifi, ethernet and openthread sections, so for a halow-only
+    device it returns None and the builder reports "could not be resolved" even
+    on the same network. Wrap the property so it falls back to halow's
+    use_address. Runs when this module is imported, i.e. during config loading,
+    before the address is read. Leaves ESPHome alone if the property is missing.
+    """
+    core_cls = type(CORE)
+    original = getattr(core_cls, "address", None)
+    if not isinstance(original, property) or getattr(original.fget, "_halow_hook", False):
+        if not isinstance(original, property):
+            _LOGGER.debug("halow: CORE.address is not a property; address hook skipped")
+        return
+
+    def address(self):
+        value = original.fget(self)
+        if value is None and self.config is not None and DOMAIN in self.config:
+            value = self.config[DOMAIN].get(CONF_USE_ADDRESS)
+        return value
+
+    address._halow_hook = True
+    core_cls.address = property(address, original.fset, original.fdel, original.__doc__)
+
+
+DOMAIN = "halow"
+_install_address_hook()
 
 halow_ns = cg.esphome_ns.namespace("halow")
 HalowComponent = halow_ns.class_("HalowComponent", cg.Component)
@@ -209,6 +250,9 @@ CONFIG_SCHEMA = cv.All(
             # Cap TX power below the regulatory maximum (dBm)
             cv.Optional(CONF_MAX_TX_POWER): cv.int_range(min=1, max=30),
             cv.Optional(CONF_MANUAL_IP): MANUAL_IP_SCHEMA,
+            # Host for wireless logs/OTA from the CLI or Device Builder. Needed when
+            # mDNS can't reach the device (e.g. the HaLow network is a separate subnet)
+            cv.Optional(CONF_USE_ADDRESS): cv.string_strict,
             # SPI pins — defaults match XIAO HaLow Hat
             cv.Optional(CONF_CLK_PIN, default=7): cv.int_range(
                 min=0, max=ESP32S3_MAX_GPIO

@@ -36,6 +36,8 @@ How the `halow` component works today. This is the current reference; [HALOW_NOT
 6. `_patch_network_util()` writes patched copies of ESPHome's `network/util.h` and `util.cpp` into the build tree. See [ESPHOME_COMPAT.md](ESPHOME_COMPAT.md).
 7. Registers `pre_build.py` for the PlatformIO toolchain only.
 
+At import, `_install_address_hook()` also makes ESPHome's `CORE.address` fall back to `halow.use_address`, so the CLI and Device Builder can find the device for wireless logs and OTA (see [ESPHOME_COMPAT.md](ESPHOME_COMPAT.md)). This is host-side only and doesn't change the firmware.
+
 ## Runtime
 
 ### Tasks and shared state

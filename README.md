@@ -405,7 +405,7 @@ firmware_version:
 
 **"Connect timeout" with no `STA state: CONNECTING`** — the device never found the AP. Check `country_code` matches the AP's region: the channel plans don't overlap in the way you might expect (for example, a `US` device won't find an `AU` AP).
 
-**Device Builder: "All specified devices ['OTA'] could not be resolved"** when opening logs or installing wirelessly. The builder finds devices by mDNS (`<name>.local`), which doesn't cross subnets. Set `use_address: <device IP>` under `halow:`, and give the device a fixed address (a DHCP reservation on the AP, or `manual_ip`). The machine running Home Assistant must also be able to route to that IP.
+**Device Builder: "All specified devices ['OTA'] could not be resolved"** when opening logs or installing wirelessly. The builder finds devices by mDNS (`<name>.local`), which doesn't cross subnets. Set `use_address: <device IP>` under `halow:`, and give the device a fixed address (a DHCP reservation on the AP, or `manual_ip`). The machine running Home Assistant must also be able to route to that IP. If you updated from an earlier version of this component and it still says "could not be resolved", click Install once (or edit and save the YAML) to clear ESPHome's old config cache.
 
 **The device reboots every 15 minutes** — that's ESPHome's API `reboot_timeout`: with no Home Assistant client connected for 15 minutes it restarts. It means HA can't reach the device (see the previous item). While you sort out the network, set `api: reboot_timeout: 0s` to stop it.
 

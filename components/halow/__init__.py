@@ -183,8 +183,46 @@ def _install_address_hook():
     core_cls.address = property(address, original.fset, original.fdel, original.__doc__)
 
 
+def _disable_validated_config_cache():
+    """Stop ESPHome caching halow configs, so the address hook always runs.
+
+    For `logs` and `upload`, ESPHome reuses a cache of the validated config
+    (esphome/compiled_config.py) and skips validation, so this module is never
+    imported, _install_address_hook() never runs, and CORE.address is None again
+    ("could not be resolved"). That's the path the Device Builder takes after an
+    install. Without a cache ESPHome simply validates again, which imports this
+    module. So for configs containing halow:, the cache writer deletes any
+    existing cache file instead of writing one. Other configs are unaffected.
+    """
+    try:
+        from esphome import compiled_config, writer
+    except ImportError:
+        return
+    original = getattr(compiled_config, "save_compiled_config", None)
+    path_of = getattr(compiled_config, "compiled_config_path", None)
+    if original is None or path_of is None or getattr(original, "_halow_hook", False):
+        return
+
+    def save_compiled_config(config):
+        if not isinstance(config, dict) or DOMAIN not in config:
+            original(config)
+            return
+        try:
+            path_of(CORE.config_filename).unlink(missing_ok=True)
+        except OSError as err:
+            _LOGGER.debug("halow: could not remove validated-config cache: %s", err)
+        _LOGGER.debug("halow: validated-config cache disabled (see ESPHOME_COMPAT.md)")
+
+    save_compiled_config._halow_hook = True
+    compiled_config.save_compiled_config = save_compiled_config
+    # writer.py imported the function by name, so replace its reference too
+    if getattr(writer, "save_compiled_config", None) is original:
+        writer.save_compiled_config = save_compiled_config
+
+
 DOMAIN = "halow"
 _install_address_hook()
+_disable_validated_config_cache()
 
 halow_ns = cg.esphome_ns.namespace("halow")
 HalowComponent = halow_ns.class_("HalowComponent", cg.Component)

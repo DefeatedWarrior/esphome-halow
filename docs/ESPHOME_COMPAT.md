@@ -56,7 +56,11 @@ Relies on `mdns_init()` returning `ESP_OK` without re-initialising when the resp
 
 **Now:** `halow:` has a `use_address` option (defaulting like wifi's: the static IP, else `<name>.local`), and `_install_address_hook()` wraps the `CORE.address` property at module import so it falls back to `halow.use_address`. If `address` stops being a property, the hook does nothing (logged at debug level).
 
-**Check:** with `use_address: <ip>`, `esphome logs test.yaml --device OTA` must print `Starting log output from <ip>`, not "could not be resolved".
+**Validated-config cache:** for `logs` and `upload`, ESPHome 2026.x loads `.esphome/storage/<file>.validated.json` and skips validation, so this module (and the hook) never loads. `_disable_validated_config_cache()` therefore replaces `compiled_config.save_compiled_config` (and the reference `writer.py` imported) with a version that deletes the cache file for halow configs instead of writing it. If ESPHome renames these functions the patch does nothing and the "second run fails" bug returns, so re-test after upgrades.
+
+**Check:** with `use_address: <ip>`, run `esphome logs test.yaml --device OTA` **twice** (and once after a `compile`). Every run must print `Starting log output from <ip>` and none may print "Loaded validated config cache"; no `.validated.json` should exist for the config.
+
+**Upstream fix:** let `CORE.address` fall back to the storage sidecar's `address` or to any component's `use_address`. Then both hooks can be removed.
 
 ### 9. PlatformIO toolchain
 

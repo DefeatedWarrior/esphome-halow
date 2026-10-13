@@ -44,6 +44,6 @@ Follow the checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#verification-c
 - Tested: ESPHome 2026.9.1, ESP-IDF 5.5.5, MM-IoT-SDK `96d9bf4` (morselib 2.10.4, firmware 1.17.6), BCF `bcf_mf16858.mbin`.
 - Pins: SCK 7, MISO 8, MOSI 9, CS 4, IRQ 3, RESET 1, WAKE 2, BUSY 5.
 - `country_code` is required: AU, CA, EU, GB, IN, JP, KR, NZ, US.
-- `use_address` (host-side only) tells the CLI/Device Builder where the device is; `_install_address_hook()` makes ESPHome's `CORE.address` read it, since ESPHome only looks at wifi/ethernet/openthread. Needed whenever mDNS can't reach the device (separate HaLow subnet).
+- `use_address` (host-side only) tells the CLI/Device Builder where the device is; `_install_address_hook()` makes ESPHome's `CORE.address` read it, since ESPHome only looks at wifi/ethernet/openthread. Needed whenever mDNS can't reach the device (separate HaLow subnet). `_disable_validated_config_cache()` stops ESPHome caching halow configs, because a cached `logs`/`upload` run never loads the component and the hook wouldn't run. Always test `esphome logs --device OTA` twice.
 - Power save is disabled (BUSY pin unreliable in this firmware). Sub-bands off by default (8 MHz).
 - The RF front end (TX amplifier) runs from the 5 V/USB rail and powers up at `mmwlan_sta_enable()`.

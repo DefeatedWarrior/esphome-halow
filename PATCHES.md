@@ -357,4 +357,20 @@ No change to the component's behaviour.
 
 **Fix.** New `use_address` option under `halow:`, defaulting like wifi's (static IP if set, else `<name>.local`). The component wraps the `CORE.address` property so it falls back to `halow.use_address`; if ESPHome ever changes that property the hook just does nothing.
 
-**Verified:** with the previous code, `esphome logs <config> --device OTA` reproduces the exact error. With this change and `use_address: 10.1.30.195`, it prints `Starting log output from 10.1.30.195 using esphome API`. The firmware is byte-for-byte the same size (the change is host-side only). Not verified: an actual log session from Home Assistant, which also needs HA to have a route to the HaLow network.
+**First version was incomplete** (found in review): it was only tested on the first, uncached run. For `logs` and `upload`, ESPHome reuses a cache of the validated config written by the previous compile or logs run (`esphome/compiled_config.py`) and skips validation, so the component's Python never loads and the address hook never runs. The second `esphome logs` printed "Loaded validated config cache… skipping validation" and then "could not be resolved". That's the path the Device Builder takes after an install.
+
+**Second fix.** For configs containing `halow:`, the component replaces ESPHome's cache writer (`save_compiled_config`, also referenced from `writer.py`) with one that deletes any existing cache file instead of writing one. Without a cache ESPHome validates again, which loads the component and the hook. Other configs are untouched. The cost is a few seconds of validation each time logs or a wireless upload starts, as before ESPHome added the cache. The storage sidecar is still written, and already records the right address.
+
+**Verified (ESPHome 2026.9.1, `use_address: 10.1.30.195`):**
+
+| Scenario | Result |
+|----------|--------|
+| Previous code, `esphome logs --device OTA` | First run resolves; second run loads the cache and fails ("could not be resolved"). Reproduces the report. |
+| No cache, `logs` twice | Both resolve; no cache file written |
+| Stale cache left by the previous version | First run still fails; after editing the YAML, every run resolves and the cache is gone |
+| Stale cache, then `compile`, then `logs` twice | Compile removes the cache; both log runs resolve; sidecar `address` is `10.1.30.195` |
+| `upload --device OTA` twice after that compile | Both go to `10.1.30.195` |
+
+The firmware is unchanged (host-side only). Not verified: an actual log session from Home Assistant, which also needs HA to have a route to the HaLow network.
+
+**Proper fix belongs in ESPHome:** `CORE.address` could fall back to the storage sidecar's `address`, or to any network component's `use_address`. Then both hooks could go.

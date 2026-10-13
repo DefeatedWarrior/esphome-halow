@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,9 +21,11 @@ from esphome.const import (
 )
 from esphome.core import coroutine_with_priority, CORE, EsphomeError
 from esphome.components.esp32 import (
+    VARIANT_ESP32S3,
     add_extra_build_file,
     add_idf_component,
     add_idf_sdkconfig_option,
+    get_esp32_variant,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -451,7 +454,8 @@ async def to_code(config):
     # --- MM-IoT-SDK Integration ---
 
     sdk_path = os.path.abspath(os.path.expanduser(config[CONF_MM_IOT_SDK_PATH]))
-    framework_path = _ensure_sdk(sdk_path)
+    is_default_path = sdk_path == os.path.abspath(os.path.expanduser(DEFAULT_SDK_PATH))
+    framework_path = _ensure_sdk(sdk_path, warn_on_other_version=is_default_path)
 
     # Register IDF components
     components = [
@@ -516,7 +520,10 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH", 4096)
 
     # Kconfig: ESP32-S3
-    add_idf_sdkconfig_option("CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB", True)
+    if get_esp32_variant() == VARIANT_ESP32S3:
+        add_idf_sdkconfig_option("CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB", True)
+
+    # Kconfig: crypto used by the Morse supplicant
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_NIST_KW_C", True)
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_CMAC_C", True)  # OMAC1 for WPA3/PMF; ESPHome disables it by default
 
@@ -557,10 +564,15 @@ def _git(*args, cwd=None):
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
 
 
-def _ensure_sdk(sdk_path):
+def _ensure_sdk(sdk_path, warn_on_other_version=True):
     """Download the pinned MM-IoT-SDK if needed and return its framework path."""
     framework_path = os.path.join(sdk_path, "framework")
     if not os.path.isdir(framework_path):
+        if os.path.isdir(sdk_path) and os.listdir(sdk_path):
+            raise EsphomeError(
+                f"{sdk_path} exists but doesn't contain the MM-IoT-SDK (no framework/ "
+                "folder). Delete it to re-download, or point mm_iot_sdk_path at an SDK."
+            )
         _LOGGER.info(
             "Downloading MM-IoT-SDK %s to %s ...", MM_IOT_SDK_COMMIT[:7], sdk_path
         )
@@ -574,6 +586,8 @@ def _ensure_sdk(sdk_path):
         for step in steps:
             result = _git(*step, cwd=sdk_path)
             if result.returncode != 0:
+                # Don't leave a half-initialised checkout that breaks the next build
+                shutil.rmtree(sdk_path, ignore_errors=True)
                 raise EsphomeError(
                     f"Failed to download MM-IoT-SDK (git {step[0]}): "
                     f"{result.stderr.strip()}\nManually run: git clone "
@@ -583,6 +597,8 @@ def _ensure_sdk(sdk_path):
         _LOGGER.info("MM-IoT-SDK downloaded successfully")
         return framework_path
 
+    if not warn_on_other_version:
+        return framework_path
     head = _git("rev-parse", "HEAD", cwd=sdk_path)
     if head.returncode == 0 and head.stdout.strip() != MM_IOT_SDK_COMMIT:
         _LOGGER.warning(

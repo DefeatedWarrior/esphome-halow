@@ -229,7 +229,7 @@ components/halow/halow_component.cpp  +29 -1  (header path, GPIO disarm, tcpip_i
 
 # Part 2: fixes from code review
 
-A full review of the component turned up one more ESPHome 2026.x break and a set of bugs that predate it. All of these are on the `improvements` branch.
+A full review of the component turned up one more ESPHome 2026.x break and a set of bugs that predate it. These are merged into `main`; the state before them is kept on the `pre-improvements` branch.
 
 **How they were verified:** everything compiles and links on ESPHome 2026.9.1 (59.8% flash, 26.0% RAM with every sensor enabled). Config validation was exercised with good and bad configs. The network patch was confirmed in the build output (the API server's object file calls `halow::network_is_connected()`). The pinned SDK download was run into an empty folder. **None of the runtime behaviour in this part has been tested on hardware yet**: the test board was resetting whenever its radio powered up (a hardware/power fault, see the README's Troubleshooting), so nothing past "Connecting" could be exercised.
 
@@ -317,3 +317,21 @@ ESPHOME_ALWAYS_INLINE inline bool is_connected() {
 - `sta_status_cb` bounds-checks the state before indexing its name table.
 - Removed the `-I~/.platformio/...` include path (superseded by fix 1). `pre_build.py` is only registered for the PlatformIO toolchain.
 - README: pin table fixed (five XIAO labels were off by one), Troubleshooting section added, configuration table and scan-result docs updated, ESP32-C6 marked unsupported.
+
+---
+
+# Part 3: second review
+
+A second pass over the Part 2 code before merging it into `main`. Same verification as Part 2 (compile, config validation, build-output checks; no runtime hardware testing).
+
+| # | Problem | Fix |
+|---|---------|-----|
+| 15 | `manual_ip` `dns1`/`dns2` were stored but never applied, so a static-IP device had no DNS (SNTP, HTTP by hostname, ...). | Applied with `mmipal_set_dns_server()` after `mmipal_init()`. |
+| 16 | If `mmwlan_sta_disable()` failed, the reconnect timer re-armed itself without ever calling `sta_enable()`. Since Part 2 also routes a failed first connect through the timer, that could retry forever without connecting. | A failed disable is logged and the reconnect continues; `sta_enable()` restarts the connection by itself if the STA is still enabled. |
+| 17 | A failed SDK download left a half-initialised `git` folder, and every later build failed on it. | The partial download is removed on failure; a non-empty folder without the SDK gives a clear error. |
+| 18 | The SDK version warning also fired for a deliberately chosen `mm_iot_sdk_path`. | Only warns for the default, auto-downloaded path. |
+| 19 | Part 2 called the component "ESP32-S3 only", but morselib ships ESP32-C3, C6 and P4 libraries too. | Docs now say "tested on ESP32-S3 only"; the S3-only cache option is only set on the S3. |
+| 20 | First connect after a timeout logged "LINK RECOVERED after <uptime>s downtime". | Only logged after a real disconnect. |
+| 21 | Scan callback copied `ssid`/`bssid` without a null check; stale byte-counter comment. | Guarded; comment rewritten. |
+
+The README also gained a Troubleshooting entry for the 15-minute API `reboot_timeout` restart, which is what a device does when Home Assistant can't reach it.

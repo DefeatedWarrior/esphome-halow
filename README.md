@@ -25,7 +25,7 @@ LoRa still wins on raw range (10-15km vs ~1km) and power efficiency for simple o
 |-------|--------|-------|
 | Seeed XIAO ESP32-S3 | Tested | Default pin mapping matches HaLow Hat |
 | Other ESP32-S3 boards | Should work | Configure SPI pins in YAML |
-| ESP32-C6 | Not supported | The component sets ESP32-S3-specific options |
+| ESP32-C3 / C6 / P4 | Untested | The MM-IoT-SDK ships libraries for these; set the pins for your board |
 
 ### Access Points
 | AP | Status | Notes |
@@ -252,6 +252,8 @@ but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discov
 
 **"Connect timeout" with no `STA state: CONNECTING`** — the device never found the AP. Check `country_code` matches the AP's region: the channel plans don't overlap in the way you might expect (for example, a `US` device won't find an `AU` AP).
 
+**The device reboots every 15 minutes** — that's ESPHome's API `reboot_timeout`: with no Home Assistant client connected for 15 minutes it restarts. It means HA can't reach the device (see the previous item). While you sort out the network, set `api: reboot_timeout: 0s` to stop it.
+
 **Changes to this repo don't show up in the Home Assistant ESPHome Builder** — external components are cached for a day. Add `refresh: 1min` (or `always`) under the `external_components` source.
 
 **"halow: could not find is_connected() in ESPHome's network component"** — your ESPHome version restructured the network component and this component needs updating; it refuses to build rather than produce firmware that silently drops API connections.
@@ -261,7 +263,7 @@ but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discov
 - **Power save disabled** — The MM6108 BUSY pin has a firmware bug (confirmed by Morse Micro). Power save is disabled to ensure reliable bidirectional communication. The radio therefore draws full receive current all the time. Monitor [firmware releases](https://github.com/MorseMicro/firmware_binaries/releases/) for a fix.
 - **TWT not yet implemented** — Requires working BUSY pin for battery operation. A GPIO-based workaround exists but is not integrated.
 - **Station mode, MM6108 only** — AP mode and the MM8108 are not implemented; the config rejects them.
-- **ESP32-S3 only** — other ESP32 variants are not supported.
+- **Tested on ESP32-S3 only** — the SDK also supports ESP32-C3, C6 and P4, but this component hasn't been run on them.
 
 ## Component Configuration
 
@@ -276,7 +278,7 @@ but nothing on your LAN can reach them — no ping, no API, no OTA, no HA discov
 | `bcf_file` | string | `bcf_mf16858.mbin` | Board configuration file; checked against the SDK at compile time |
 | `sub_bands` | bool | `false` | `false` = 8 MHz max throughput, `true` = 1-2 MHz max range |
 | `max_tx_power` | int | *(regulatory max)* | Cap TX power, 1-30 dBm. Can only lower power, never exceed the regulatory limit |
-| `manual_ip` | schema | *(DHCP)* | Static IP config (static_ip, gateway, subnet, dns1, dns2) |
+| `manual_ip` | schema | *(DHCP)* | Static IP config (static_ip, gateway, subnet, dns1, dns2). Set `dns1` if the device needs name resolution (e.g. SNTP, HTTP) |
 | `mm_iot_sdk_path` | string | `~/.esphome/mm-iot-esp32` | Where the MM-IoT-SDK is downloaded / found |
 | `clk_pin` | int | `7` | SPI clock GPIO |
 | `mosi_pin` | int | `9` | SPI MOSI GPIO |

@@ -157,13 +157,12 @@ static void do_halow_reconnect(TimerHandle_t t) {
   s_reconnecting = true;
   ESP_LOGW(TAG, "=== RECONNECTING (from timer) ===");
 
+  // Not fatal: sta_enable() itself disconnects and restarts the connection if the
+  // STA is still enabled, and the STA may never have been enabled if the first
+  // connect attempt in setup() failed.
   enum mmwlan_status status = mmwlan_sta_disable();
   if (status != MMWLAN_SUCCESS) {
-    ESP_LOGW(TAG, "sta_disable failed (%d), will retry", status);
-    s_reconnecting = false;
-    // Restart timer to retry
-    xTimerStart(s_reconnect_timer, 0);
-    return;
+    ESP_LOGW(TAG, "sta_disable failed (%d), continuing", status);
   }
 
   // Re-enable with stored config
@@ -211,11 +210,9 @@ static volatile bool s_scan_complete = false;
 static volatile bool s_scan_running = false;
 
 // --- Byte Counters (for kbps sensors) ---
-// TX: hook netif->output (etharp_output wrapper) to count outgoing bytes.
-// RX: hook netif->linkoutput is TX-only. The SDK calls tcpip_input() directly for RX,
-//     bypassing netif->input. So for RX bytes we estimate from packet counts × avg size,
-//     or we wrap the linkoutput for TX and use a LWIP raw PCB for RX.
-//     Simplest correct approach: wrap linkoutput for TX, use pcb recv for RX.
+// TX: netif->linkoutput is wrapped (halow_linkoutput_hook) once the link is up.
+// RX: the SDK calls tcpip_input() directly, bypassing netif->input, so it is
+//     wrapped at link time (__wrap_tcpip_input) and filtered to mmipal's "MM" netif.
 static volatile uint32_t s_tx_bytes = 0;
 static volatile uint32_t s_rx_bytes = 0;
 static netif_linkoutput_fn s_original_linkoutput = nullptr;
@@ -402,6 +399,19 @@ void HalowComponent::setup() {
     this->mark_failed();
     return;
   }
+  if (this->use_static_ip_) {
+    // With a static address there is no DHCP to supply DNS servers
+    const std::string *dns[] = {&this->static_dns1_, &this->static_dns2_};
+    for (uint8_t i = 0; i < 2; i++) {
+      if (dns[i]->empty() || *dns[i] == "0.0.0.0")
+        continue;
+      mmipal_ip_addr_t addr = {0};
+      strncpy(addr, dns[i]->c_str(), sizeof(addr) - 1);
+      if (mmipal_set_dns_server(i, addr) != MMIPAL_SUCCESS) {
+        ESP_LOGW(TAG, "Could not set DNS server %u: %s", i + 1, dns[i]->c_str());
+      }
+    }
+  }
 
   // Register mmipal link status callback — this handles reconnection via a FreeRTOS timer.
   // The callback fires on link down, starts a 15-second timer, which then does
@@ -469,7 +479,7 @@ void HalowComponent::loop() {
       if (sta_ready && this->check_ip_()) {
         // Connected and got IP
         this->state_ = HalowState::CONNECTED;
-        if (this->reconnect_count_ > 0) {
+        if (this->reconnect_count_ > 0 && this->disconnect_time_ != 0) {
           uint32_t downtime_s = (millis() - this->disconnect_time_) / 1000;
           ESP_LOGI(TAG, "=== LINK RECOVERED === after %lus downtime (%lu attempts)",
                    (unsigned long) downtime_s, (unsigned long) this->reconnect_count_);
@@ -883,9 +893,12 @@ std::string HalowComponent::get_ip_address_str() const {
 
 static void halow_scan_rx_cb(const struct mmwlan_scan_result *result, void *arg) {
   ScanEntry entry{};
-  size_t ssid_len = std::min<size_t>(result->ssid_len, MMWLAN_SSID_MAXLEN);
-  memcpy(entry.ssid, result->ssid, ssid_len);
-  memcpy(entry.bssid, result->bssid, 6);
+  if (result->ssid != nullptr) {
+    size_t ssid_len = std::min<size_t>(result->ssid_len, MMWLAN_SSID_MAXLEN);
+    memcpy(entry.ssid, result->ssid, ssid_len);
+  }
+  if (result->bssid != nullptr)
+    memcpy(entry.bssid, result->bssid, 6);
   entry.rssi = result->rssi;
   entry.noise_dbm = result->noise_dbm;
   entry.freq_hz = result->channel_freq_hz;
